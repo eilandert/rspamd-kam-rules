@@ -1,15 +1,15 @@
 {
-  "converted_rule_count": 3248,
+  "converted_rule_count": 3249,
   "converted_rule_types": {
     "body": 1179,
     "full": 2,
-    "header": 1116,
+    "header": 1117,
     "meta": 690,
     "mimeheader": 38,
     "rawbody": 67,
     "uri": 156
   },
-  "dropped_meta_count": 179,
+  "dropped_meta_count": 180,
   "dropped_metas": {
     "GB_BADJS": [
       "T_HTML_ATTACH",
@@ -447,14 +447,16 @@
       "__GB_NN_ALONDE",
       "__GB_NN_AME",
       "__GB_NN_BOX",
-      "__GB_NN_CLOUDFL"
+      "__GB_NN_CLOUDFL",
+      "__GB_NN_FITBIT"
     ],
     "KAM_MAILBOX2": [
       "KAM_MAILBOX",
       "__GB_NN_ALONDE",
       "__GB_NN_AME",
       "__GB_NN_BOX",
-      "__GB_NN_CLOUDFL"
+      "__GB_NN_CLOUDFL",
+      "__GB_NN_FITBIT"
     ],
     "KAM_MAILBOX3": [
       "KAM_MAILBOX",
@@ -635,6 +637,10 @@
       "DKIM_VALID_AU",
       "DKIM_VALID_EF"
     ],
+    "__GB_NN_FITBIT": [
+      "DKIM_VALID_AU",
+      "DMARC_PASS"
+    ],
     "__GB_RCPT_EMPTY": [
       "__HAS_TO"
     ],
@@ -648,28 +654,28 @@
   "omitted_examples": [
     {
       "directive": "unsupported_header",
-      "line": 6475,
+      "line": 6477,
       "text": "header   __GB_TO_ADDR_FREEMAIL    eval:check_freemail_header('To:addr')"
     },
     {
       "directive": "unsupported_header",
-      "line": 6476,
+      "line": 6478,
       "text": "header   __GB_TO_NAME_FREEMAIL    eval:check_freemail_header('To:name')"
     },
     {
       "directive": "unsupported_header",
-      "line": 6481,
+      "line": 6483,
       "text": "header   __GB_FROM_ADDR_FREEMAIL  eval:check_freemail_header('From:addr')"
     },
     {
       "directive": "unsupported_header",
-      "line": 6482,
+      "line": 6484,
       "text": "header   __GB_FROM_NAME_FREEMAIL  eval:check_freemail_header('From:name')"
     }
   ],
-  "output_bytes": 625090,
-  "output_sha256": "a829f75f0af0dcb2a17f1540b446db9d63804d8d193a48227f8fbac2b1541cc4",
-  "source_bytes": 616302,
-  "source_sha256": "2ec0affce38e08d6119893936d91031bb64f28f598499b2ddc6d75f8b1283dde",
+  "output_bytes": 625238,
+  "output_sha256": "181d0e451011e2068f7358d800cdd31001703c975b9334333cdcc22bb5a8a9b7",
+  "source_bytes": 616582,
+  "source_sha256": "2e6ba76fe2e1ae17e564f3ddfc4ce9d0654dadfbdec84ea7a5758a5f66669d21",
   "source_url": "https://mcgrail.com/downloads/KAM.cf"
 }
