@@ -5,52 +5,44 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 KAM_URL="https://mcgrail.com/downloads/KAM.cf"
-TIMESTAMP_FILE="$SCRIPT_DIR/.last-modified"
 LOGFILE="$SCRIPT_DIR/update.log"
+SOURCE_FILE=$(mktemp "$SCRIPT_DIR/.KAM.cf.XXXXXX")
+trap 'rm -f "$SOURCE_FILE"' EXIT
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
 }
 
-# Get remote Last-Modified timestamp via HEAD request
 log "Checking KAM.cf for updates..."
-REMOTE_TIMESTAMP=$(curl -sI "$KAM_URL" | grep -i '^Last-Modified:' | cut -d' ' -f2- | tr -d '\r')
-
-if [[ -z "$REMOTE_TIMESTAMP" ]]; then
-    log "ERROR: Could not fetch Last-Modified header from $KAM_URL"
+if ! curl -fsSL --retry 3 --retry-delay 2 -o "$SOURCE_FILE" "$KAM_URL"; then
+    log "ERROR: Could not download $KAM_URL"
     exit 1
 fi
 
-log "Remote timestamp: $REMOTE_TIMESTAMP"
+SOURCE_SHA=$(sha256sum "$SOURCE_FILE" | awk '{print $1}')
+CURRENT_SHA=$(
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source_sha256", ""))' \
+        "$SCRIPT_DIR/dist/report.json" 2>/dev/null || true
+)
+log "Downloaded source SHA-256: $SOURCE_SHA"
 
-# Check if we have a stored timestamp
-if [[ -f "$TIMESTAMP_FILE" ]]; then
-    LOCAL_TIMESTAMP=$(cat "$TIMESTAMP_FILE")
-    log "Local timestamp:  $LOCAL_TIMESTAMP"
-
-    if [[ "$REMOTE_TIMESTAMP" == "$LOCAL_TIMESTAMP" ]]; then
-        log "No changes detected. Skipping update."
-        exit 0
-    fi
-
-    log "Changes detected!"
-else
-    log "No local timestamp found. First run."
+if [[ "$SOURCE_SHA" == "$CURRENT_SHA" ]]; then
+    log "No content changes detected. Skipping update."
+    exit 0
 fi
 
-# Update detected - download and compile
-log "Downloading and compiling KAM.cf..."
-if python3 kam_rspamd.py >> "$LOGFILE" 2>&1; then
+log "Content changed; compiling KAM.cf..."
+if python3 kam_rspamd.py \
+    --input "$SOURCE_FILE" \
+    --url "$KAM_URL" \
+    --expected-sha256 "$SOURCE_SHA" >> "$LOGFILE" 2>&1; then
     log "Successfully compiled KAM.cf"
-
-    # Store new timestamp
-    echo "$REMOTE_TIMESTAMP" > "$TIMESTAMP_FILE"
-    log "Updated local timestamp"
 
     # Optional: auto-deploy to rspamd
     # Uncomment the following lines to auto-deploy:
     # log "Deploying to rspamd..."
-    # sudo cp dist/kam.lua /etc/rspamd/plugins.d/kam.lua
+    # sudo install -m 0644 dist/kam.lua /etc/rspamd/plugins.d/kam.lua
+    # Merge config/kam.conf into /etc/rspamd/rspamd.conf.local once.
     # sudo rspamadm configtest && sudo systemctl restart rspamd
     # log "Deployed and restarted rspamd"
 

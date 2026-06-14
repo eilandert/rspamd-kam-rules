@@ -184,6 +184,18 @@ def meta_dependencies(expression: str) -> set[str]:
     return set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", expression))
 
 
+def external_meta_dependencies(rules: dict[str, Rule], external_symbols: set[str]) -> set[str]:
+    dependencies: set[str] = set()
+    for rule in rules.values():
+        if rule.kind != "meta":
+            continue
+        for dependency in meta_dependencies(rule.expression):
+            target = SYMBOL_REPLACEMENTS.get(dependency, dependency)
+            if dependency not in rules and target in external_symbols:
+                dependencies.add(target)
+    return dependencies
+
+
 def parse_rules(
     source: bytes,
     external_symbols: set[str],
@@ -347,15 +359,24 @@ def lua_string(value: str) -> str:
 
 LUA_RUNTIME = """local expressions = {}
 local rule_count = 0
+local disabled_rule_count = 0
 
 local function parse_atom(str)
   return str:match('^([^, %s%(%)><+!|&]+)') or ''
 end
 
-local function match_data(rule, data, raw)
-  if not data then return 0 end
-  if rule.multiple then return rule.re:matchn(data, rule.maxhits or -1, raw) end
+local function match_data(rule, data, raw, max_matches)
+  if not data or not rule.re or rule.disabled then return 0 end
+  if rule.multiple then return rule.re:matchn(data, max_matches or -1, raw) end
   return rule.re:match(data, raw) and 1 or 0
+end
+
+local function add_matches(rule, total, data, raw)
+  if rule.maxhits and total >= rule.maxhits then return rule.maxhits, true end
+  local remaining = rule.maxhits and (rule.maxhits - total) or -1
+  total = total + match_data(rule, data, raw, remaining)
+  if rule.maxhits and total >= rule.maxhits then return rule.maxhits, true end
+  return total, total > 0 and not rule.multiple
 end
 
 local function match_header(task, rule)
@@ -363,13 +384,13 @@ local function match_header(task, rule)
   if rule.header == 'ToCc' then header_names = { 'To', 'Cc', 'Bcc' } end
   if rule.header == 'MESSAGEID' then header_names = { 'Message-ID', 'X-Message-ID', 'Resent-Message-ID' } end
   if rule.header == 'ALL' then
-    local raw_headers = task:get_raw_headers()
-    local result = match_data(rule, raw_headers, true)
+    local result = add_matches(rule, 0, task:get_raw_headers(), true)
     if rule.negate then return result > 0 and 0 or 1 end
     return result
   end
   local matched = false
   local hits = 0
+  local done = false
   for _, header_name in ipairs(header_names) do
     local values = {}
     if rule.kind == 'mimeheader' then
@@ -388,17 +409,21 @@ local function match_header(task, rule)
       if rule.header_mode == 'addr' then
         local addresses = rspamd_util.parse_mail_address(value or '') or {}
         for _, address in ipairs(addresses) do
-          if address.addr then hits = hits + match_data(rule, address.addr, false) end
+          if address.addr then hits, done = add_matches(rule, hits, address.addr, false) end
+          if done then break end
         end
       elseif rule.header_mode == 'name' then
         local addresses = rspamd_util.parse_mail_address(value or '') or {}
         for _, address in ipairs(addresses) do
-          if address.name then hits = hits + match_data(rule, address.name, false) end
+          if address.name then hits, done = add_matches(rule, hits, address.name, false) end
+          if done then break end
         end
       elseif value then
-        hits = hits + match_data(rule, value, rule.header_mode == 'raw')
+        hits, done = add_matches(rule, hits, value, rule.header_mode == 'raw')
       end
+      if done then break end
     end
+    if done then break end
   end
   matched = hits > 0
   if rule.negate then matched = not matched end
@@ -414,6 +439,8 @@ local function eval_atom(name, task)
   local result = 0
   if not rule then
     result = task:has_symbol(replacements[name] or name) and 1 or 0
+  elseif rule.disabled then
+    result = 0
   elseif rule.kind == 'meta' then
     local expression = expressions[name]
     if expression then
@@ -422,18 +449,23 @@ local function eval_atom(name, task)
   elseif rule.kind == 'header' or rule.kind == 'mimeheader' then
     result = match_header(task, rule)
   elseif rule.kind == 'body' then
+    local done = false
+    if not rule.nosubject then
+      result, done = add_matches(rule, result, task:get_subject(), false)
+    end
     for _, part in ipairs(task:get_text_parts() or {}) do
-      result = result + match_data(rule, part:get_content(), false)
-      if result > 0 and not rule.multiple then break end
+      if done then break end
+      result, done = add_matches(rule, result, part:get_content(), false)
     end
   elseif rule.kind == 'rawbody' then
-    result = match_data(rule, task:get_rawbody(), true)
+    result = add_matches(rule, 0, task:get_rawbody(), true)
   elseif rule.kind == 'full' then
-    result = match_data(rule, task:get_content(), true)
+    result = add_matches(rule, 0, task:get_content(), true)
   elseif rule.kind == 'uri' then
+    local done = false
     for _, url in ipairs(task:get_urls() or {}) do
-      result = result + match_data(rule, url:get_text(), false)
-      if result > 0 and not rule.multiple then break end
+      result, done = add_matches(rule, result, url:get_text(), false)
+      if done then break end
     end
   end
   cache[name] = result or 0
@@ -445,16 +477,17 @@ for name, rule in pairs(rules) do
   if rule.kind == 'meta' then
     expressions[name] = rspamd_expression.create(rule.expression, parse_atom, rspamd_config:get_mempool())
     if not expressions[name] then
+      rule.disabled = true
+      disabled_rule_count = disabled_rule_count + 1
       rspamd_logger.errx(rspamd_config, 'cannot compile KAM meta %s: %s', name, rule.expression)
     end
   else
-    -- Matched directly in eval_atom; not registered with the config (a
-    -- registered regexp whose result is never queried only wastes a hyperscan
-    -- slot at load time).
     rule.re = rspamd_regexp.create(rule.expression)
     if rule.re then
       rule.re:set_max_hits(rule.multiple and (rule.maxhits or -1) or 1)
     else
+      rule.disabled = true
+      disabled_rule_count = disabled_rule_count + 1
       rspamd_logger.errx(rspamd_config, 'cannot compile KAM regexp %s: %s', name, rule.expression)
     end
   end
@@ -462,17 +495,11 @@ end
 
 local function kam_callback(task)
   for name, rule in pairs(rules) do
-    if rule.kind ~= 'meta' then
+    if rule.score ~= 0 then
       local result = eval_atom(name, task)
-      if rule.score ~= 0 and result and result > 0 then task:insert_result(name, result) end
-    end
-  end
-  for name, rule in pairs(rules) do
-    if rule.kind == 'meta' then
-      local result = eval_atom(name, task)
-      -- A meta fires once when its expression is true; its arithmetic value is
-      -- not a hit count, so insert with weight 1 (not result) to avoid scaling.
-      if rule.score ~= 0 and result and result > 0 then task:insert_result(name, 1) end
+      if result and result > 0 then
+        task:insert_result(name, rule.kind == 'meta' and 1 or result)
+      end
     end
   end
 end
@@ -481,6 +508,10 @@ local parent_id = rspamd_config:register_symbol({
   name = 'KAM_RULES_MODULE', type = 'normal', callback = kam_callback,
   score = 0.01, priority = 5, group = 'KAM'
 })
+
+for _, dependency in ipairs(external_dependencies) do
+  rspamd_config:register_dependency('KAM_RULES_MODULE', dependency)
+end
 
 -- Every scored rule is a virtual child of KAM_RULES_MODULE and belongs to the
 -- 'KAM' group. The group is uncapped (no max_score) — purely organisational, so
@@ -494,11 +525,21 @@ for name, rule in pairs(rules) do
   end
 end
 
-rspamd_logger.infox(rspamd_config, 'loaded %s generated KAM Lua rules', tostring(rule_count))
+rspamd_logger.infox(
+  rspamd_config,
+  'loaded %s generated KAM Lua rules (%s disabled after compile errors)',
+  tostring(rule_count),
+  tostring(disabled_rule_count)
+)
 """
 
 
-def generate_lua(rules: dict[str, Rule], source_url: str, source_sha256: str) -> bytes:
+def generate_lua(
+    rules: dict[str, Rule],
+    source_url: str,
+    source_sha256: str,
+    external_dependencies: set[str],
+) -> bytes:
     lines = [
         "-- Generated by rspamd-kam-rules. Do not edit.",
         f"-- Source: {source_url}",
@@ -528,6 +569,8 @@ def generate_lua(rules: dict[str, Rule], source_url: str, source_sha256: str) ->
             fields.append("negate = true")
         if "multiple" in rule.tflags:
             fields.append("multiple = true")
+        if "nosubject" in rule.tflags:
+            fields.append("nosubject = true")
         if rule.maxhits is not None:
             fields.append(f"maxhits = {rule.maxhits}")
         lines.append(f'  ["{name}"] = {{ {", ".join(fields)} }},')
@@ -536,6 +579,11 @@ def generate_lua(rules: dict[str, Rule], source_url: str, source_sha256: str) ->
     lines.append("local replacements = {")
     for source, target in sorted(SYMBOL_REPLACEMENTS.items()):
         lines.append(f'  ["{source}"] = {lua_string(target)},')
+    lines.append("}")
+    lines.append("")
+    lines.append("local external_dependencies = {")
+    for dependency in sorted(external_dependencies):
+        lines.append(f"  {lua_string(dependency)},")
     lines.append("}")
     lines.append("")
     return ("\n".join(lines) + "\n" + LUA_RUNTIME).encode()
@@ -548,18 +596,29 @@ def convert(
     min_rules: int,
     external_symbols: set[str] | None = None,
     unavailable_symbols: set[str] | None = None,
+    expected_sha256: str | None = None,
 ) -> tuple[bytes, dict]:
     if len(source) < min_bytes:
         raise ConversionError(f"source is unexpectedly small: {len(source)} bytes < {min_bytes}")
     source_sha256 = hashlib.sha256(source).hexdigest()
+    if expected_sha256 is not None:
+        expected_sha256 = expected_sha256.lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ConversionError("expected SHA-256 must be exactly 64 hexadecimal characters")
+        if source_sha256 != expected_sha256:
+            raise ConversionError(
+                f"source SHA-256 mismatch: {source_sha256} != {expected_sha256}"
+            )
+    external = set(external_symbols or ())
     rules, omitted, examples, dropped = parse_rules(
         source,
-        external_symbols or set(),
+        external,
         unavailable_symbols or set(),
     )
     if len(rules) < min_rules:
         raise ConversionError(f"too few converted rules: {len(rules)} < {min_rules}")
-    lua = generate_lua(rules, source_url, source_sha256)
+    dependencies = external_meta_dependencies(rules, external)
+    lua = generate_lua(rules, source_url, source_sha256, dependencies)
     report = {
         "source_url": source_url,
         "source_bytes": len(source),
@@ -572,14 +631,17 @@ def convert(
         "omitted_examples": examples,
         "dropped_metas": dropped,
         "dropped_meta_count": len(dropped),
+        "external_dependencies": sorted(dependencies),
+        "external_dependency_count": len(dependencies),
     }
     return lua, report
 
 
-def atomic_write(path: Path, content: bytes) -> None:
+def atomic_write(path: Path, content: bytes, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(content)
             handle.flush()
@@ -603,6 +665,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--min-bytes", type=int, default=100_000)
     parser.add_argument("--min-rules", type=int, default=1_000)
+    parser.add_argument("--expected-sha256")
     parser.add_argument("--external-symbols", type=Path, default=root / "config" / "external-symbols.txt")
     parser.add_argument("--unavailable-symbols", type=Path, default=root / "config" / "unavailable-symbols.txt")
     args = parser.parse_args()
@@ -615,6 +678,7 @@ def main() -> int:
         args.min_rules,
         read_symbol_file(args.external_symbols),
         read_symbol_file(args.unavailable_symbols),
+        args.expected_sha256,
     )
     atomic_write(args.output, lua)
     atomic_write(args.report, (json.dumps(report, indent=2, sort_keys=True) + "\n").encode())

@@ -23,6 +23,9 @@ jobs:
       - name: Run tests
         run: python3 -m unittest discover -s tests -v
 
+      - name: Run Rspamd runtime tests
+        run: bash tests/test_runtime.sh
+
   update:
     # Only refresh + publish on a schedule or manual dispatch; push/PR runs
     # just exercise the test job above. (A fork PR has a read-only token and
@@ -43,30 +46,37 @@ jobs:
         id: check
         run: |
           KAM_URL="https://mcgrail.com/downloads/KAM.cf"
+          SOURCE_FILE="$RUNNER_TEMP/KAM.cf"
 
-          # Get remote Last-Modified timestamp
-          REMOTE_TS=$(curl -sI "$KAM_URL" | grep -i '^Last-Modified:' | cut -d' ' -f2- | tr -d '\r')
-          echo "Remote timestamp: $REMOTE_TS"
+          curl -fsSL --retry 3 --retry-delay 2 -o "$SOURCE_FILE" "$KAM_URL"
+          SOURCE_SHA=$(sha256sum "$SOURCE_FILE" | awk '{print $1}')
+          CURRENT_SHA=$(python3 -c \
+            'import json; print(json.load(open("dist/report.json")).get("source_sha256", ""))')
 
-          # Check stored timestamp (if exists)
-          if [[ -f .last-modified ]]; then
-            LOCAL_TS=$(cat .last-modified)
-            echo "Local timestamp:  $LOCAL_TS"
-
-            if [[ "$REMOTE_TS" == "$LOCAL_TS" ]]; then
-              echo "No changes detected"
-              echo "changed=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+          echo "Downloaded source SHA-256: $SOURCE_SHA"
+          echo "source_file=$SOURCE_FILE" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          if [[ "$SOURCE_SHA" == "$CURRENT_SHA" ]]; then
+            echo "No content changes detected"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Content changed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
-
-          echo "Changes detected or first run"
-          echo "changed=true" >> $GITHUB_OUTPUT
-          echo "$REMOTE_TS" > .last-modified
 
       - name: Update KAM rules
         if: steps.check.outputs.changed == 'true'
-        run: python3 kam_rspamd.py
+        run: |
+          python3 kam_rspamd.py \
+            --input "${{ steps.check.outputs.source_file }}" \
+            --url "https://mcgrail.com/downloads/KAM.cf" \
+            --expected-sha256 "${{ steps.check.outputs.source_sha }}"
+
+      - name: Validate updated plugin
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          python3 -m unittest discover -s tests -v
+          bash tests/test_runtime.sh
 
       - name: Commit and push if changed
         if: steps.check.outputs.changed == 'true'
