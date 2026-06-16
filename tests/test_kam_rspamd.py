@@ -200,6 +200,11 @@ class ConversionTests(unittest.TestCase):
         self.assertIn("Wolfgang Breyha", text)
         self.assertIn("The converter itself (rspamd-kam-rules) is MIT-licensed.", text)
 
+    def test_generated_lua_carries_generation_date(self):
+        converted, _ = kam_rspamd.convert(FIXTURE.read_bytes(), "test", 1, 1)
+        text = converted.decode()
+        self.assertRegex(text, r"-- Generated: \d{4}-\d{2}-\d{2} \(UTC\)")
+
 
 class LuaStringTests(unittest.TestCase):
     """The injection defense: rule/symbol text is emitted as Lua long-bracket
