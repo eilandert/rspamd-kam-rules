@@ -694,8 +694,8 @@
     }
   ],
   "output_bytes": 629116,
-  "output_sha256": "1f9fa18273735e1da1f843d330d9b87890a32bed33b5f6cdb8aad016ef9947b4",
-  "source_bytes": 618051,
-  "source_sha256": "2061ed2e7834c604dd946a4888b98592751650ede1dd9df0d2036bca44cdc2ea",
+  "output_sha256": "c0831b048f415f8039abb1c313b9d87f47aa7eed2384b00fce4dc0c38f496f29",
+  "source_bytes": 618869,
+  "source_sha256": "72c600e7ed364d8c11f02a89e1a6f7702c195d821b9a2266e2c9eddabc1876fe",
   "source_url": "https://mcgrail.com/downloads/KAM.cf"
 }
