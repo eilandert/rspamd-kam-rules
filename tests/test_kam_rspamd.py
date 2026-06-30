@@ -13,9 +13,26 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "sample.cf"
 
 
+def map_header(mapdata: bytes) -> dict:
+    """The jsonl map's first line: replacements + external_dependencies."""
+    return json.loads(mapdata.decode().splitlines()[0])
+
+
+def map_rules(mapdata: bytes) -> dict:
+    """Index every rule object in the jsonl map by its symbol name. Rule data
+    moved out of the Lua plugin into this map, so the converter's data-shape
+    assertions check here; the Lua side only carries the static runtime."""
+    rules = {}
+    for line in mapdata.decode().splitlines()[1:]:
+        if line.strip():
+            obj = json.loads(line)
+            rules[obj["name"]] = obj
+    return rules
+
+
 class ConversionTests(unittest.TestCase):
     def test_convert_generates_lua_with_flags_headers_and_meta(self):
-        converted, report = kam_rspamd.convert(
+        converted, mapdata, report = kam_rspamd.convert(
             FIXTURE.read_bytes(),
             "fixture://sample.cf",
             min_bytes=1,
@@ -23,14 +40,19 @@ class ConversionTests(unittest.TestCase):
             external_symbols={"R_SPF_ALLOW"},
         )
         text = converted.decode()
+        rules = map_rules(mapdata)
 
-        self.assertIn("local rules = {", text)
-        self.assertIn("expression = [=[/foo[A-Za-z]/is]=]", text)
-        self.assertIn("header = [=[Subject]=]", text)
-        self.assertIn("expression = [=[(SAMPLE_BODY && SAMPLE_HEADER)]=]", text)
+        # Rule data now lives in the map …
+        self.assertEqual(rules["SAMPLE_BODY"]["expression"], "/foo[A-Za-z]/is")
+        self.assertEqual(rules["SAMPLE_HEADER"]["header"], "Subject")
+        self.assertEqual(rules["SAMPLE_META"]["expression"], "(SAMPLE_BODY && SAMPLE_HEADER)")
+        # … while the thin plugin carries only the static runtime.
         self.assertIn("rspamd_expression.create", text)
         self.assertIn("rspamd_regexp.create", text)
-        self.assertNotIn("register_regexp", text)
+        # Native fast path: regexps register into the combined Hyperscan DB and
+        # are scanned via task:process_regexp.
+        self.assertIn("register_regexp", text)
+        self.assertIn("task:process_regexp", text)
         self.assertNotIn("UNSUPPORTED", text)
         self.assertEqual(report["converted_rule_count"], 3)
         self.assertEqual(report["omitted_directives"], {"askdns": 1})
@@ -46,7 +68,7 @@ class ConversionTests(unittest.TestCase):
             b"meta GOOD (LOCAL && SPF_PASS)\n"
             b"meta BAD (LOCAL && MISSING)\n"
         )
-        converted, report = kam_rspamd.convert(
+        converted, mapdata, report = kam_rspamd.convert(
             source,
             "test",
             min_bytes=1,
@@ -54,10 +76,11 @@ class ConversionTests(unittest.TestCase):
             external_symbols={"R_SPF_ALLOW"},
         )
         text = converted.decode()
+        rules = map_rules(mapdata)
 
-        self.assertIn('["GOOD"]', text)
-        self.assertNotIn('["BAD"]', text)
-        self.assertIn("[=[R_SPF_ALLOW]=]", text)
+        self.assertIn("GOOD", rules)
+        self.assertNotIn("BAD", rules)
+        self.assertIn("R_SPF_ALLOW", map_header(mapdata)["external_dependencies"])
         self.assertIn(
             "rspamd_config:register_dependency('KAM_RULES_MODULE', dependency)",
             text,
@@ -73,15 +96,20 @@ class ConversionTests(unittest.TestCase):
             b"uri COUNTED /example/\n"
             b"tflags COUNTED multiple maxhits=2\n"
         )
-        converted, _ = kam_rspamd.convert(source, "test", 1, 1)
+        converted, mapdata, _ = kam_rspamd.convert(source, "test", 1, 1)
         text = converted.decode()
+        rules = map_rules(mapdata)
 
-        with_subject = next(line for line in text.splitlines() if '["WITH_SUBJECT"]' in line)
-        without_subject = next(line for line in text.splitlines() if '["WITHOUT_SUBJECT"]' in line)
-        self.assertNotIn("nosubject = true", with_subject)
-        self.assertIn("nosubject = true", without_subject)
-        self.assertIn("local function add_matches", text)
-        self.assertIn("rule.maxhits - total", text)
+        # SA `nosubject` is a no-op under rspamd (sabody already excludes the
+        # Subject), so it is intentionally NOT carried into the map.
+        self.assertNotIn("nosubject", rules["WITH_SUBJECT"])
+        self.assertNotIn("nosubject", rules["WITHOUT_SUBJECT"])
+        self.assertTrue(rules["COUNTED"]["multiple"])
+        self.assertEqual(rules["COUNTED"]["maxhits"], 2)
+        # maxhits/multiple are applied via the regexp's max-hits cap, fed into
+        # the combined-DB scan rather than counted in Lua.
+        self.assertIn("set_max_hits", text)
+        self.assertIn("rule.maxhits", text)
 
     def test_drops_rule_name_with_lua_metacharacters(self):
         source = (
@@ -89,11 +117,11 @@ class ConversionTests(unittest.TestCase):
             b"body GOOD_RULE /y/\n"
             b"score GOOD_RULE 1.0\n"
         )
-        converted, report = kam_rspamd.convert(source, "test", 1, 1)
-        text = converted.decode()
+        converted, mapdata, report = kam_rspamd.convert(source, "test", 1, 1)
+        rules = map_rules(mapdata)
 
-        self.assertNotIn("os.execute", text)
-        self.assertIn('["GOOD_RULE"]', text)
+        self.assertNotIn("os.execute", mapdata.decode())
+        self.assertIn("GOOD_RULE", rules)
         self.assertEqual(report["omitted_directives"].get("invalid_name"), 1)
 
     def test_if_plugin_conditions(self):
@@ -105,16 +133,17 @@ class ConversionTests(unittest.TestCase):
             b"if !plugin(Mail::SpamAssassin::Plugin::Nope)\n"
             b"body IF_NOTUNKNOWN /c/\nscore IF_NOTUNKNOWN 1.0\nendif\n"
         )
-        converted, _ = kam_rspamd.convert(source, "test", 1, 1)
-        text = converted.decode()
+        _, mapdata, _ = kam_rspamd.convert(source, "test", 1, 1)
+        rules = map_rules(mapdata)
 
-        self.assertIn('["IF_KNOWN"]', text)
-        self.assertIn('["IF_NOTUNKNOWN"]', text)
-        self.assertNotIn('["IF_UNKNOWN"]', text)
+        self.assertIn("IF_KNOWN", rules)
+        self.assertIn("IF_NOTUNKNOWN", rules)
+        self.assertNotIn("IF_UNKNOWN", rules)
 
     def test_cli_writes_matching_report(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "kam.lua"
+            map_path = Path(directory) / "kam_rules.map"
             report_path = Path(directory) / "report.json"
             subprocess.run(
                 [
@@ -126,6 +155,8 @@ class ConversionTests(unittest.TestCase):
                     "fixture://sample.cf",
                     "--output",
                     str(output),
+                    "--map",
+                    str(map_path),
                     "--report",
                     str(report_path),
                     "--min-bytes",
@@ -137,7 +168,9 @@ class ConversionTests(unittest.TestCase):
             )
             report = json.loads(report_path.read_text())
             self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(), report["output_sha256"])
+            self.assertEqual(hashlib.sha256(map_path.read_bytes()).hexdigest(), report["map_sha256"])
             self.assertEqual(output.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(map_path.stat().st_mode & 0o777, 0o644)
             self.assertEqual(report_path.stat().st_mode & 0o777, 0o644)
 
     def test_expected_sha256_rejects_wrong_source(self):
@@ -148,12 +181,12 @@ class ConversionTests(unittest.TestCase):
     def test_local_rules_merged_into_output(self):
         source = b"body UPSTREAM /up/\nscore UPSTREAM 1\n"
         local = b"rawbody LOCAL_RULE /(?:<br\\/?>){8}/mi\nscore LOCAL_RULE 2.0\n"
-        converted, report = kam_rspamd.convert(
+        _, mapdata, report = kam_rspamd.convert(
             source, "test", min_bytes=1, min_rules=2, local_rules=local
         )
-        text = converted.decode()
-        self.assertIn("UPSTREAM", text)
-        self.assertIn("LOCAL_RULE", text)
+        rules = map_rules(mapdata)
+        self.assertIn("UPSTREAM", rules)
+        self.assertIn("LOCAL_RULE", rules)
         self.assertEqual(report["converted_rule_count"], 2)
         self.assertIsNotNone(report["local_rules_sha256"])
 
@@ -163,45 +196,44 @@ class ConversionTests(unittest.TestCase):
         source = b"body UPSTREAM /up/\nscore UPSTREAM 1\n"
         local = b"rawbody LOCAL_RULE /x/\nscore LOCAL_RULE 1\n"
         digest = hashlib.sha256(source).hexdigest()
-        converted, report = kam_rspamd.convert(
+        _, mapdata, report = kam_rspamd.convert(
             source, "test", min_bytes=1, min_rules=2,
             expected_sha256=digest, local_rules=local,
         )
         self.assertEqual(report["source_sha256"], digest)
-        self.assertIn("LOCAL_RULE", converted.decode())
+        self.assertIn("LOCAL_RULE", map_rules(mapdata))
 
     def test_local_rules_none_leaves_report_field_null(self):
-        _, report = kam_rspamd.convert(b"body X /x/\nscore X 1\n", "test", 1, 1)
+        _, _, report = kam_rspamd.convert(b"body X /x/\nscore X 1\n", "test", 1, 1)
         self.assertIsNone(report["local_rules_sha256"])
 
     def test_generated_runtime_disables_failed_regexps(self):
-        converted, _ = kam_rspamd.convert(b"body BAD /(/\nscore BAD 1\n", "test", 1, 1)
+        converted, _, _ = kam_rspamd.convert(b"body BAD /(/\nscore BAD 1\n", "test", 1, 1)
         text = converted.decode()
 
-        self.assertIn("if not data or not rule.re or rule.disabled then return 0 end", text)
+        # A regexp that fails to compile is flagged disabled (never registered
+        # into the DB) and scores nothing.
         self.assertIn("rule.disabled = true", text)
+        self.assertIn("elseif rule.disabled then", text)
 
     def test_header_modes_and_negation(self):
         source = (
             b"header ADDR_RULE From:addr =~ /evil/i\nscore ADDR_RULE 1.0\n"
             b"header NEG_RULE Subject !~ /ok/\nscore NEG_RULE 1.0\n"
         )
-        converted, _ = kam_rspamd.convert(source, "test", 1, 1)
-        text = converted.decode()
+        _, mapdata, _ = kam_rspamd.convert(source, "test", 1, 1)
+        rules = map_rules(mapdata)
 
-        addr = next(line for line in text.splitlines() if '["ADDR_RULE"]' in line)
-        neg = next(line for line in text.splitlines() if '["NEG_RULE"]' in line)
-        self.assertIn("header = [=[From]=]", addr)
-        self.assertIn("header_mode = [=[addr]=]", addr)
-        self.assertNotIn("negate = true", addr)
-        self.assertIn("header = [=[Subject]=]", neg)
-        self.assertIn("negate = true", neg)
+        self.assertEqual(rules["ADDR_RULE"]["header"], "From")
+        self.assertEqual(rules["ADDR_RULE"]["header_mode"], "addr")
+        self.assertNotIn("negate", rules["ADDR_RULE"])
+        self.assertEqual(rules["NEG_RULE"]["header"], "Subject")
+        self.assertTrue(rules["NEG_RULE"]["negate"])
 
     def test_multiple_tflag_emitted(self):
         source = b"body M /x/\ntflags M multiple\nscore M 1\n"
-        converted, _ = kam_rspamd.convert(source, "test", 1, 1)
-        line = next(l for l in converted.decode().splitlines() if '["M"]' in l)
-        self.assertIn("multiple = true", line)
+        _, mapdata, _ = kam_rspamd.convert(source, "test", 1, 1)
+        self.assertTrue(map_rules(mapdata)["M"]["multiple"])
 
     def test_min_bytes_threshold(self):
         with self.assertRaisesRegex(kam_rspamd.ConversionError, "unexpectedly small"):
@@ -217,22 +249,147 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(kam_rspamd.ConversionError, "64 hexadecimal"):
             kam_rspamd.convert(b"body X /x/\n", "test", 1, 1, expected_sha256="nothex")
 
-    def test_generated_lua_carries_kam_license_and_credits(self):
-        converted, _ = kam_rspamd.convert(FIXTURE.read_bytes(), "test", 1, 1)
-        text = converted.decode()
+    def test_map_header_carries_kam_license_and_credits(self):
+        # The KAM.cf credits + Apache notice travel WITH the rules, in the map
+        # header (the data file users download), not baked into the lua runtime.
+        _, mapdata, _ = kam_rspamd.convert(FIXTURE.read_bytes(), "test", 1, 1)
+        header = json.loads(mapdata.decode().splitlines()[0])
+        credits = "\n".join(header["_kam_credits"])
+        license_text = "\n".join(header["_kam_license"])
 
         self.assertIn(
-            "Copyright (c) 2022 Kevin A. McGrail and The McGrail Foundation", text
+            "Copyright (c) 2022 Kevin A. McGrail and The McGrail Foundation", credits
         )
-        self.assertIn("Apache License, Version 2.0", text)
-        self.assertIn("Karsten Bräckelmann", text)
-        self.assertIn("Wolfgang Breyha", text)
+        self.assertIn("Karsten Bräckelmann", credits)
+        self.assertIn("Wolfgang Breyha", credits)
+        self.assertIn("Apache License, Version 2.0", license_text)
+        self.assertIn("rspamd-kam-rules) itself is MIT-licensed.", license_text)
+
+    def test_generated_lua_points_at_map_license(self):
+        # The lua keeps only a short pointer, no baked rule provenance.
+        converted, _, _ = kam_rspamd.convert(FIXTURE.read_bytes(), "test", 1, 1)
+        text = converted.decode()
+        self.assertIn("kam_rules.map header", text)
         self.assertIn("The converter itself (rspamd-kam-rules) is MIT-licensed.", text)
 
-    def test_generated_lua_carries_generation_date(self):
-        converted, _ = kam_rspamd.convert(FIXTURE.read_bytes(), "test", 1, 1)
+    def test_generated_lua_carries_project_header(self):
+        converted, _, _ = kam_rspamd.convert(FIXTURE.read_bytes(), "test", 1, 1)
         text = converted.decode()
-        self.assertRegex(text, r"-- Generated: \d{4}-\d{2}-\d{2} \(UTC\)")
+        self.assertIn(kam_rspamd.PROJECT_COPYRIGHT, text)
+        self.assertIn(kam_rspamd.PROJECT_HOMEPAGE, text)
+        # Pointer to our other Rspamd modules.
+        self.assertIn(kam_rspamd.PROJECT_OVERVIEW, text)
+        # Mini-howto travels in the file.
+        self.assertIn("Quick start:", text)
+        self.assertIn("systemctl reload rspamd", text)
+
+
+class MapAndPluginSplitTests(unittest.TestCase):
+    """The thin-plugin / data-map split: rule bodies live in the jsonl map, the
+    Lua plugin reads it at config load to register symbols + compile the native
+    combined-Hyperscan DB. A download-only HTTP watch refreshes the cache copy;
+    applying it still needs a full reload (registration is config-load-only)."""
+
+    def test_committed_lua_matches_generator(self):
+        # The static dist/kam.lua must equal generate_lua() for its pinned source.
+        # The daily CI regens map+report WITHOUT --emit-lua by design, so a
+        # LUA_RUNTIME edit that forgets to re-emit would leave a stale committed
+        # plugin and runtime tests would still pass against it. Guard the invariant.
+        report = json.loads((ROOT / "dist" / "report.json").read_text())
+        regenerated = kam_rspamd.generate_lua(
+            report["source_url"], report["source_sha256"]
+        )
+        committed = (ROOT / "dist" / "kam.lua").read_bytes()
+        self.assertEqual(
+            committed, regenerated,
+            "dist/kam.lua is stale — run `python3 kam_rspamd.py --emit-lua`",
+        )
+        self.assertEqual(report["output_sha256"], hashlib.sha256(committed).hexdigest())
+
+    def test_map_header_carries_replacements_and_deps(self):
+        _, mapdata, _ = kam_rspamd.convert(
+            b"body LOCAL /x/\nmeta GOOD (LOCAL && SPF_PASS)\n",
+            "test", 1, 1, external_symbols={"R_SPF_ALLOW"},
+        )
+        header = map_header(mapdata)
+        self.assertEqual(header["_kam"], 1)
+        # SPF_PASS -> R_SPF_ALLOW remap must travel in the map header, not the Lua.
+        self.assertEqual(header["replacements"]["SPF_PASS"], "R_SPF_ALLOW")
+        self.assertIn("R_SPF_ALLOW", header["external_dependencies"])
+
+    def test_map_header_carries_project_metadata(self):
+        _, mapdata, _ = kam_rspamd.convert(b"body A /a/\nscore A 1\n", "test", 1, 1)
+        header = map_header(mapdata)
+        self.assertEqual(header["_copyright"], kam_rspamd.PROJECT_COPYRIGHT)
+        self.assertEqual(header["_homepage"], kam_rspamd.PROJECT_HOMEPAGE)
+        self.assertEqual(header["_overview"], kam_rspamd.PROJECT_OVERVIEW)
+        # Source provenance lives in the map (the file that tracks KAM.cf).
+        self.assertEqual(header["_source_url"], "test")
+        self.assertRegex(header["_source_sha256"], r"^[0-9a-f]{64}$")
+        # Mini-howto carried as a list of lines.
+        self.assertIn("Quick start:", header["_howto"])
+
+    def test_map_is_jsonl_with_one_object_per_rule(self):
+        _, mapdata, report = kam_rspamd.convert(
+            b"body A /a/\nscore A 1\nbody B /b/\nscore B 1\n", "test", 1, 1
+        )
+        lines = [l for l in mapdata.decode().splitlines() if l.strip()]
+        # header + one line per rule, every line a standalone JSON object.
+        self.assertEqual(len(lines), 1 + report["converted_rule_count"])
+        for line in lines:
+            json.loads(line)
+
+    def test_plugin_reads_bundled_map_at_config_load(self):
+        converted, _, _ = kam_rspamd.convert(b"body A /a/\nscore A 1\n", "test", 1, 1)
+        text = converted.decode()
+        # Synchronous init load (registration + native DB compile is config-load-only).
+        # Refactored into a read_file() helper; init prefers the cache copy then
+        # falls back to the seed.
+        self.assertIn("local function read_file(path)", text)
+        self.assertIn("io.open(path, 'r')", text)
+        self.assertIn("read_file(kam_cache_path)", text)
+        self.assertIn("read_file(kam_map_path)", text)
+        # C1 self-update: add_map watch is back, but DOWNLOAD-ONLY — it writes the
+        # cache and never re-registers (which it can't post-load).
+        self.assertIn("add_map", text)
+        self.assertIn("type = 'callback'", text)
+        self.assertIn("url = kam_map_url", text)
+        # Atomic write: tmp + rename, never a direct write to the live cache path.
+        self.assertIn("os.rename(tmp, kam_cache_path)", text)
+        # All three paths/url overridable via the kam {} config block.
+        self.assertIn("opts.map_path or", text)
+        self.assertIn("opts.cache_path or", text)
+        self.assertIn("opts.map_url or", text)
+        # Plugin declares an empty rules table that the map fills — no baked data.
+        self.assertIn("local rules = {}", text)
+
+    def test_self_update_watch_is_download_only(self):
+        converted, _, _ = kam_rspamd.convert(b"body A /a/\nscore A 1\n", "test", 1, 1)
+        text = converted.decode()
+        watch = text.split("add_map", 1)[1]
+        # The watch callback must NOT register/compile rules — registration is
+        # config-load-only, so a post-load register_regexp/register_symbol in the
+        # callback would be a bug.
+        callback = watch.split("callback = function(content)", 1)[1].split("})", 1)[0]
+        self.assertNotIn("register_regexp", callback)
+        self.assertNotIn("register_symbol", callback)
+        self.assertNotIn("compile_rule", callback)
+        # It writes the rspamd-writable cache, never the read-only seed.
+        self.assertIn("kam_cache_path", callback)
+        self.assertNotIn("kam_map_path", callback)
+        # Default cache lives under /var/lib/rspamd (DBDIR, rspamd-user writable);
+        # /etc/rspamd is root-owned and would EACCES.
+        self.assertIn("/var/lib/rspamd/kam_rules.map", text)
+        # Default map_url points at the published map.
+        self.assertIn("/dist/kam_rules.map", text)
+
+    def test_map_rule_names_restricted_to_symbol_charset(self):
+        # The Lua loader re-validates names, but the emitter must never put a
+        # name outside [A-Za-z0-9_] into the map in the first place.
+        source = b'body FOO"]=os.execute(\'id\')--  /x/\nbody GOOD /y/\nscore GOOD 1\n'
+        _, mapdata, _ = kam_rspamd.convert(source, "test", 1, 1)
+        for name in map_rules(mapdata):
+            self.assertRegex(name, r"\A[A-Za-z0-9_]+\Z")
 
 
 class LuaStringTests(unittest.TestCase):
@@ -279,6 +436,14 @@ class HelperFunctionTests(unittest.TestCase):
         self.assertEqual(kam_rspamd.extract_regex(r"/a\/b/"), r"/a\/b/")
         self.assertIsNone(kam_rspamd.extract_regex("plain text"))
         self.assertIsNone(kam_rspamd.extract_regex(""))
+        # Perl paired-bracket delimiters (m{} m() m[] m<>) close with a
+        # different char and may nest (quantifiers like {2}); must not be
+        # silently dropped by single-char-delimiter scanning.
+        self.assertEqual(kam_rspamd.extract_regex("m{spam}i"), "m{spam}i")
+        self.assertEqual(kam_rspamd.extract_regex("m{a{2}b}s"), "m{a{2}b}s")
+        self.assertEqual(kam_rspamd.extract_regex("m(x)"), "m(x)")
+        self.assertEqual(kam_rspamd.extract_regex("m[y]x"), "m[y]x")
+        self.assertEqual(kam_rspamd.extract_regex("m<z> rest"), "m<z>")
 
     def test_meta_dependencies_extracts_symbols_only(self):
         self.assertEqual(
@@ -298,6 +463,56 @@ class HelperFunctionTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o644)
             # No leftover temp files from the atomic rename.
             self.assertEqual(list(path.parent.glob(".out.bin.*")), [])
+
+    def test_active_lines_else_branch_and_comment_skip(self):
+        # An inactive `if` block flips active in its `else`; comments/blanks drop.
+        text = (
+            "# comment\n"
+            "\n"
+            "if !plugin(Mail::SpamAssassin::Plugin::FreeMail)\n"
+            "body INACTIVE /x/\n"
+            "else\n"
+            "body ACTIVE /y/\n"
+            "endif\n"
+        )
+        names = [line.split()[1] for _, line in kam_rspamd.active_lines(text)]
+        self.assertEqual(names, ["ACTIVE"])
+
+    def test_report_flags_unexpanded_tag_rules(self):
+        # A regex rule whose <tag> is never expanded (not in replace_rules) keeps
+        # the literal tag, fails to compile at load, and is disabled silently;
+        # the report must surface it so a parse regression is visible in CI.
+        source = (
+            b"body GOOD /plain/\n"
+            b"score GOOD 1\n"
+            b"body TAGGED /<UNDEFINED>/\n"
+            b"score TAGGED 1\n"
+        )
+        _, _, report = kam_rspamd.convert(source, "test", 1, 1)
+        self.assertEqual(report["unexpanded_tag_rules"], ["TAGGED"])
+        self.assertEqual(report["unexpanded_tag_rule_count"], 1)
+
+    def test_report_carries_shared_generated_date(self):
+        # The map header date and the report date come from one shared value, so
+        # the artifacts never disagree on the ruleset version. (The lua runtime is
+        # static and intentionally carries no date — it lives in the map.)
+        _, mapdata, report = kam_rspamd.convert(b"body X /x/\n", "test", 1, 1)
+        date = report["generated_date"]
+        header = json.loads(mapdata.decode().splitlines()[0])
+        self.assertEqual(header["_generated"], date)
+
+    def test_external_meta_dependencies_maps_through_replacements(self):
+        # A meta atom that isn't a local rule but resolves (directly or via
+        # SYMBOL_REPLACEMENTS) to an external symbol is reported as a dependency;
+        # a local atom or an unknown one is not.
+        rules = {
+            "LOCAL": kam_rspamd.Rule("LOCAL", "body", "/x/"),
+            "M": kam_rspamd.Rule("M", "meta", "(LOCAL && DKIM_VALID && UNKNOWN)"),
+        }
+        deps = kam_rspamd.external_meta_dependencies(rules, {"R_DKIM_ALLOW"})
+        # DKIM_VALID -> R_DKIM_ALLOW (a replacement) is external; LOCAL is local;
+        # UNKNOWN resolves to nothing external.
+        self.assertEqual(deps, {"R_DKIM_ALLOW"})
 
 
 if __name__ == "__main__":

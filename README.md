@@ -1,6 +1,6 @@
 # rspamd-kam-rules
 
-**Transpile SpamAssassin's KAM.cf ruleset into a single native Rspamd Lua plugin.**
+**Turn SpamAssassin's KAM.cf ruleset into a single native Rspamd Lua plugin.**
 
 > 📖 **Full write-up:** [KAM.cf in Rspamd: 3,200 SpamAssassin Rules, Native Lua, No Perl](https://deb.myguard.nl/2026/06/kam-cf-rspamd-lua-converter/) — why the naive `spamassassin` module approach bites, and how this converter avoids it.
 
@@ -8,99 +8,155 @@
 
 [KAM.cf](https://mcgrail.com/downloads/KAM.cf) is Kevin A. McGrail's SpamAssassin
 ruleset — 3,000+ patterns that have caught phishing, malware droppers, and lottery
-scams for years. It's good. It's also written in SpamAssassin's dialect and expects
-SpamAssassin to run it.
+scams for years. It's good. But it's written in SpamAssassin's dialect and assumes
+SpamAssassin is running it.
 
-Rspamd can load raw `.cf` files through its built-in `spamassassin` module, but that
-path has three problems:
+Rspamd *can* load raw `.cf` files through its built-in `spamassassin` module, but that
+path:
 
-- It **re-parses all ~6,500 lines on every config load.**
-- It **carries hundreds of rules it can't run.**
-- It **never remaps symbol names** — `SPF_PASS` stays `SPF_PASS` instead of becoming
-  Rspamd's `R_SPF_ALLOW`. Meta rules referencing unmapped symbols compile fine, then
-  silently never fire.
+- **re-parses all ~10,600 lines on every config load**,
+- **carries hundreds of rules it can't actually run**, and
+- **never remaps symbol names** — `SPF_PASS` stays `SPF_PASS` instead of Rspamd's
+  `R_SPF_ALLOW`, so metas that reference it compile fine and then silently never fire.
 
 ## What this converter does instead
 
-It parses KAM.cf properly and emits one self-contained `dist/kam.lua`:
+It parses KAM.cf properly and emits two files:
 
-- **Maps symbols** to Rspamd equivalents — `SPF_PASS` → `R_SPF_ALLOW`, `DKIM_VALID` →
+- **`dist/kam.lua`** — a thin (~13 KB) static plugin: the runtime, no rule data.
+- **`dist/kam_rules.map`** — the rules themselves (jsonl: one regex/meta/score per line).
+
+At config load the plugin reads the map, registers each symbol, and compiles every
+simple regex into Rspamd's **combined Hyperscan database** — so the ruleset is scanned
+in one pass per message instead of running ~2,500 regexes one at a time. Along the way
+it:
+
+- **Remaps symbols** to Rspamd equivalents — `SPF_PASS` → `R_SPF_ALLOW`, `DKIM_VALID` →
   `R_DKIM_ALLOW`, the `URIBL_*` family → SURBL/DBL — so metas resolve and fire.
-- **Prunes dead metas** via fixpoint dependency resolution: any meta whose transitive
-  dependencies aren't reachable on *your* Rspamd is dropped (180 in the current run)
-  and its missing symbols recorded in the report.
+- **Prunes dead metas** — any meta whose dependencies your Rspamd can't provide is
+  dropped (172 in the current run) and its missing symbols recorded in the report.
 - **Preserves semantics** — regex flags, header modes (`addr`/`name`/`raw`/`case`),
-  `replace_tag`/`replace_rules` expansion, body-vs-Subject matching (unless
-  `nosubject`), and message-global `tflags multiple maxhits=N` scoring.
-- **Registers properly** — every scored rule is a virtual child of the
-  `KAM_RULES_MODULE` callback and joins the `KAM` symbol group, so the ruleset is one
-  unit in the UI/history. External symbols used by metas become scheduler dependencies.
-  Regexps compile via `rspamd_regexp.create`, metas via `rspamd_expression.create`.
-- **Skips the unsupported** — `askdns`, `eval:` plugin functions, and friends go to the
+  `replace_tag`/`replace_rules` expansion, and `tflags multiple maxhits=N` scoring.
+- **Skips the unsupported** — `askdns`, `eval:` plugin functions and friends go to the
   report, not the output.
-- **Pins the source** — each `kam.lua` carries the SHA-256 of the exact KAM.cf it was
-  built from.
+- **Pins the source** — `report.json` records the SHA-256 of KAM.cf, the plugin, and the
+  map, so every build is traceable to one exact upstream file.
+
+Because the plugin holds no rule data, a KAM.cf update only regenerates the map — the
+daily CI commits `dist/kam_rules.map` + `dist/report.json`, never `kam.lua`. The map is
+re-validated when loaded, so a tampered map can introduce no symbol outside the
+SpamAssassin name charset and no Lua code.
 
 ## What gets converted
 
-Of KAM.cf's ~6,500 lines, the current run converts **3,249 rules**:
+Of KAM.cf's ~10,600 lines, the current run converts **3,261 rules**:
 
 | Type | Count | Catches |
 |---|---|---|
 | body | 1,179 | message-text patterns |
 | header | 1,117 | Subject / From / Message-ID etc. |
-| meta | 690 | combined-signal verdicts |
+| meta | 699 | combined-signal verdicts |
 | uri | 156 | malicious redirectors, phishing domains |
-| rawbody | 67 | base64-obfuscated payloads pre-decode |
+| rawbody | 70 | base64-obfuscated payloads pre-decode |
 | mimeheader | 38 | forged attachments |
 | full | 2 | whole RFC 822 message |
 
-A further **180 meta rules are dropped** because they depend on symbols the target
+A further **172 meta rules are dropped** because they depend on symbols the target
 Rspamd doesn't provide (SA-plugin symbols, DNS lists, `eval:` functions).
 
 ## Install
 
+Both files must be in place before Rspamd starts — the plugin reads the map at config
+load to register symbols and build the Hyperscan DB.
+
 ```bash
-# Download the pre-compiled plugin into your Rspamd plugins directory
+# The plugin (static runtime) goes in plugins.d …
 sudo wget -O /etc/rspamd/plugins.d/kam.lua \
   https://raw.githubusercontent.com/eilandert/rspamd-kam-rules/main/dist/kam.lua
-sudo chmod 0644 /etc/rspamd/plugins.d/kam.lua
+# … and the rule map at the path the plugin reads at startup.
+sudo wget -O /etc/rspamd/kam_rules.map \
+  https://raw.githubusercontent.com/eilandert/rspamd-kam-rules/main/dist/kam_rules.map
+sudo chmod 0644 /etc/rspamd/plugins.d/kam.lua /etc/rspamd/kam_rules.map
 ```
 
-A file in `plugins.d` stays disabled until its top-level module is configured. Add this
-block to `/etc/rspamd/rspamd.conf.local` once:
+A file in `plugins.d` stays disabled until its module is configured. Add this block to
+`/etc/rspamd/rspamd.conf.local` once (full options in `examples/kam.conf`):
 
 ```ucl
 kam {
     enabled = true;
+    # Every path and the self-update URL have baked-in defaults — this is all
+    # you need. Self-update is ON by default (rspamd polls GitHub and stages a
+    # fresh map; a `systemctl reload rspamd` applies it — see Staying up to
+    # date). Set map_url = "" to disable it. Full options in examples/kam.conf.
 }
 ```
 
-Then validate and restart:
+Both example config files ship in `examples/`: `examples/kam.conf` is the block
+above with every option documented, and `examples/groups.conf` carries the `KAM`
+symbol-group metadata. To cap how much the whole ruleset can contribute, drop it in
+and uncomment `max_score` (see [Capping the score](#capping-the-score)):
+
+```bash
+sudo wget -O /etc/rspamd/local.d/groups.conf \
+  https://raw.githubusercontent.com/eilandert/rspamd-kam-rules/main/examples/groups.conf
+```
+
+Then validate and reload:
 
 ```bash
 sudo rspamadm configtest
-sudo systemctl restart rspamd
+sudo systemctl reload rspamd   # full reconfigure — re-runs plugin init
 sudo journalctl -u rspamd --since "5 minutes ago" | grep "generated KAM Lua rules"
 ```
 
 ### Staying up to date
 
-The published `dist/kam.lua` is rebuilt **daily at 03:00 UTC** by GitHub Actions, but a
-new file is only committed when KAM.cf's content actually changes. The workflow
-downloads KAM.cf once, compares its SHA-256 against `dist/report.json`, and — if it
-differs — passes that same hash to the converter so the bytes are verified before
-conversion.
+`dist/kam_rules.map` is rebuilt **daily at 03:00 UTC** by GitHub Actions, but only
+committed when KAM.cf's content actually changes (the workflow compares its SHA-256
+against `dist/report.json`). `dist/kam.lua` is static — it changes only when the runtime
+code does, not on a rule update.
 
-To pull updates automatically, re-run the `wget` above on a schedule (e.g. a daily
-cron), or watch the repo.
+**The plugin updates itself.** Rspamd polls `map_url` (the published map on GitHub by
+default) every `map_watch_interval` (default 5 minutes) and, when it changes, atomically
+writes the new map to `cache_path` (`/var/lib/rspamd/kam_rules.map` — under DBDIR, the
+only map dir the dropped-privilege rspamd user can write; `/etc/rspamd` is root-owned).
+No host cron, no `curl`, no SHA-compare script: the download is rspamd's own job.
+
+The catch: rspamd registers native regexps and symbols **only at config load**, so a
+freshly downloaded map does **not** go live on download — the poll just stages it in the
+cache. A plain `systemctl reload rspamd` (full reconfigure) applies it; the runtime
+prefers the cache copy over the shipped seed at load. So the whole update path is:
+
+```bash
+# A dumb daily timer — no fetch logic, rspamd already downloaded the map:
+sudo systemctl reload rspamd
+```
+
+Use `systemctl reload rspamd` (SIGHUP / full reconfigure), **not** `rspamadm control
+reload`: the lighter `control reload` (maps + stats only) never re-runs plugin init, so
+it would silently keep the old rules. The reload is graceful — workers drain in place,
+Bayes and greylist state live in Redis — so it's safe to run on a timer; at worst it's a
+no-op when nothing changed.
+
+Set `map_url = ""` in the `kam {}` block to disable the poll (e.g. on a host that can't
+resolve `raw.githubusercontent.com` — point it at an internal mirror instead) and fall
+back to pulling the map yourself:
+
+```bash
+sudo wget -O /etc/rspamd/kam_rules.map \
+  https://raw.githubusercontent.com/eilandert/rspamd-kam-rules/main/dist/kam_rules.map
+sudo rspamadm configtest && sudo systemctl reload rspamd
+```
+
+`update-if-changed.sh` automates that manual fetch-compare-reload cycle for the
+poll-disabled case.
 
 ### Capping the score
 
-Every KAM symbol joins the `KAM` group (child of the `KAM_RULES_MODULE` callback). The
-group is **uncapped** — symbols score additively. To cap the ruleset's total positive
-contribution, drop `config/groups.conf` in as `/etc/rspamd/local.d/groups.conf` and set
-`max_score`:
+Every KAM symbol joins the `KAM` group, which is **uncapped** — symbols score additively.
+To cap the ruleset's total contribution, drop `examples/groups.conf` in as
+`/etc/rspamd/local.d/groups.conf` and set `max_score`:
 
 ```
 group "KAM" {
@@ -111,52 +167,58 @@ group "KAM" {
 ## Build it yourself
 
 ```bash
-python3 kam_rspamd.py                  # download KAM.cf, write dist/kam.lua + dist/report.json
+python3 kam_rspamd.py                  # download KAM.cf, write dist/kam_rules.map + dist/report.json
 python3 kam_rspamd.py --input KAM.cf   # convert a local file instead
+python3 kam_rspamd.py --emit-lua       # also re-emit dist/kam.lua (only after a runtime-code change)
 python3 -m unittest discover -s tests  # Python conversion tests
 bash tests/test_runtime.sh             # Docker + Rspamd integration tests
 ```
 
-The converter uses **your** production symbol set, so the output adapts to your stack.
-Two config files describe the target Rspamd:
+The converter builds against **your** production symbol set, so the output adapts to your
+stack. Three optional config files describe the target Rspamd:
 
 - `config/external-symbols.txt` — a dump of your production Rspamd `/symbols` endpoint
-  (everything your instance can raise). KAM-defined symbols are excluded.
+  (everything your instance can raise; KAM-defined symbols are excluded).
 - `config/unavailable-symbols.txt` — KAM symbols you *know* aren't registered on your
-  stack, listed so dependent metas get pruned.
-- `config/local-rules.cf` — optional supplement in SpamAssassin syntax, appended after
-  upstream KAM.cf and compiled into the same `kam.lua`. Use it to define site-local
-  rules or to supply a missing symbol that upstream metas depend on. Override the path
-  with `--local-rules <file>`. The upstream-change SHA gate ignores this file, so editing
-  it alone won't trip `update-if-changed.sh` — rerun `python3 kam_rspamd.py` to regenerate.
+  stack, so dependent metas get pruned.
+- `config/local-rules.cf` — optional site-local rules in SpamAssassin syntax, appended
+  after upstream KAM.cf and compiled into the same output. Override the path with
+  `--local-rules <file>`. The SHA gate ignores this file, so editing it alone won't trip
+  `update-if-changed.sh` — rerun `python3 kam_rspamd.py` to regenerate.
 
-Regenerate the symbol dump whenever you change stacks, then rebuild.
+Regenerate the symbol dump whenever you change stacks, then rebuild. For a pinned local
+source, add `--expected-sha256 <hash>` — conversion fails if the bytes don't match.
 
-For a pinned local source, add `--expected-sha256 <hash>`; conversion fails if the bytes
-don't match.
+## How matching works
 
-## Performance note
+Simple `body`/`rawbody`/`full`/`uri`/`header`/`mimeheader` rules register into the
+**combined re-cache**, so Rspamd compiles them into one Hyperscan database per scan
+category and matches the whole batch in a single pass per message (`task:process_regexp`).
+Metas are then evaluated lazily over those cached results (`rspamd_expression`).
 
-The generated plugin compiles its regexps at Rspamd startup and evaluates scored rules
-(and their dependencies) lazily during the callback. It does **not** promise a single
-Hyperscan pass, and throughput depends on your corpus, enabled rules, Rspamd build, and
-hardware.
+The exception is header rules with an `addr`/`name` transform or an
+`ALL`/`ToCc`/`MESSAGEID` pseudo-header: those need per-value Lua post-processing, so they
+keep an individual regex and scan in Lua. In the current run that's a small minority of
+header rules; everything else rides the fast path.
 
-The point of this converter is **correctness and hygiene**, not a speed claim: mapped
-external symbols, explicit scheduler dependencies, dead metas pruned, and one auditable
-artifact pinned to a known KAM.cf hash. Benchmark both approaches on your own traffic
-before making performance claims.
+Real throughput still depends on your corpus, enabled rules, Rspamd build (Hyperscan vs
+PCRE fallback), and hardware — benchmark on your own traffic. The other point of the
+converter is **correctness and hygiene**: mapped external symbols, explicit scheduler
+dependencies, dead metas pruned, and one auditable artifact pinned to a known KAM.cf hash.
 
 ## License
 
 - **This project** (the converter) — MIT.
 - **KAM.cf** — Apache-2.0, original authorship preserved (Kevin A. McGrail, with Joe
-  Quinn, Karsten Bräckelmann, Bill Cole, and Giovanni Bechis). The generated
-  `dist/kam.lua` is a derivative work of KAM.cf and inherits its Apache-2.0 license.
+  Quinn, Karsten Bräckelmann, Bill Cole, and Giovanni Bechis). The generated rules are a
+  derivative work of KAM.cf and inherit its Apache-2.0 license. The full credits + Apache
+  notice travel **with the rules**, in the `kam_rules.map` header (`_kam_credits` /
+  `_kam_license` keys); `dist/kam.lua` carries only a short pointer to them.
 
 ## See also
 
 - **Article:** [KAM.cf in Rspamd: 3,200 SpamAssassin Rules, Native Lua, No Perl](https://deb.myguard.nl/2026/06/kam-cf-rspamd-lua-converter/)
 - **Background:** [Rspamd Explained: How Modern Spam Filtering Actually Works](https://deb.myguard.nl/2026/05/rspamd-explained-modern-spam-filtering-bayes-neural-rbl/)
 - **KAM.cf upstream:** [mcgrail.com/downloads/KAM.cf](https://mcgrail.com/downloads/KAM.cf)
+- **Our other Rspamd modules** (olefy, yarad, gyzor, mailstrix, …): [github.com/eilandert](https://github.com/eilandert)
 - **Rspamd:** [rspamd.com](https://rspamd.com)

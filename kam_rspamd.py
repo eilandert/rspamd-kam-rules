@@ -18,34 +18,60 @@ from pathlib import Path
 DEFAULT_URL = "https://mcgrail.com/downloads/KAM.cf"
 REGEX_TYPES = {"body", "full", "header", "mimeheader", "rawbody", "uri"}
 
-# Reproduced from the KAM.cf source header so the generated plugin — a derivative
-# work of KAM.cf — carries its credits and Apache-2.0 notice. Verbatim wording from
-# the upstream file; emitted as Lua comments at the top of kam.lua.
-KAM_LICENSE_HEADER = """\
+# Project identity, reused in both artifact headers (kam.lua + kam_rules.map).
+PROJECT_NAME = "rspamd-kam-rules"
+PROJECT_COPYRIGHT = "Copyright (c) 2026 eilandert / myguard.nl"
+PROJECT_LICENSE = "MIT (converter) — generated rules are Apache-2.0, see below"
+PROJECT_HOMEPAGE = "https://github.com/eilandert/rspamd-kam-rules"
+# Profile overview of our other Rspamd modules (olefy, yarad, gyzor, mailstrix, …).
+PROJECT_OVERVIEW = "https://github.com/eilandert"
+# Terse deploy recipe carried inside both artifacts so a downloaded file is
+# self-documenting. Kept in sync with README "Install".
+PROJECT_HOWTO = [
+    "Quick start:",
+    "  1. wget kam.lua       -> /etc/rspamd/plugins.d/kam.lua",
+    "  2. wget kam_rules.map -> /etc/rspamd/kam_rules.map",
+    "  3. add to rspamd.conf.local:  kam { enabled = true; }   (see examples/kam.conf)",
+    "  4. (optional) cap scoring: examples/groups.conf -> /etc/rspamd/local.d/groups.conf",
+    "  5. rspamadm configtest && systemctl reload rspamd",
+    "Self-update: rspamd polls map_url (github by default) every map_watch_interval",
+    "and writes a fresh map to cache_path (/var/lib/rspamd, rspamd-writable). A",
+    "'systemctl reload rspamd' timer then re-registers it (native regexps register",
+    "at config load only). Set map_url=\"\" to disable polling.",
+]
+
+# KAM.cf upstream credits + Apache-2.0 notice. The rules are a derivative work of
+# KAM.cf, so this attribution must travel WITH the rules — it lives in the map
+# header (the data file users download and update), where `_kam_credits` /
+# `_kam_license` carry it verbatim. kam.lua only points at it (KAM_LICENSE_POINTER)
+# so the runtime stays a thin shell with no baked rule provenance.
+KAM_CREDITS = [
+    "Generated from KAM.cf — the KAM ruleset for Apache SpamAssassin, a",
+    "derivative work of it.",
+    "Authors: Kevin A. McGrail, with key contributions from Joe Quinn,",
+    "         Karsten Bräckelmann, Bill Cole & Giovanni Bechis.",
+    "Thanks to Wolfgang Breyha for his help fixing a few rules.",
+    "Maintained by The McGrail Foundation, a 501(c)(3) charity.",
+    "Home: https://mcgrail.com/template/projects#KAM1",
+    "Copyright (c) 2022 Kevin A. McGrail and The McGrail Foundation",
+]
+KAM_LICENSE = [
+    "Licensed under the Apache License, Version 2.0 (the \"License\"); you may",
+    "not use these rules except in compliance with the License. Obtain a copy",
+    "at http://www.apache.org/licenses/LICENSE-2.0 . Distributed on an \"AS IS\"",
+    "BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.",
+    "The converter (rspamd-kam-rules) itself is MIT-licensed.",
+]
+
+# kam.lua is a thin runtime; the full KAM.cf credits + Apache notice live in the
+# map header (_kam_credits / _kam_license) so they travel with the rules. This
+# short pointer replaces the old in-lua license block.
+KAM_LICENSE_POINTER = """\
 -- ---------------------------------------------------------------------------
--- This plugin is generated from KAM.cf and is a derivative work of it.
--- KAM.cf — the KAM ruleset for Apache SpamAssassin.
---
--- Authors: Kevin A. McGrail, with key contributions from Joe Quinn,
---          Karsten Bräckelmann, Bill Cole & Giovanni Bechis.
--- Thanks to Wolfgang Breyha for his help fixing a few rules.
--- Maintained by The McGrail Foundation, a 501(c)(3) charity.
--- Home: https://mcgrail.com/template/projects#KAM1
---
--- Copyright (c) 2022 Kevin A. McGrail and The McGrail Foundation
---
---   Licensed under the Apache License, Version 2.0 (the "License");
---   you may not use this file except in compliance with the License.
---   You may obtain a copy of the License at
---
---       http://www.apache.org/licenses/LICENSE-2.0
---
---   Unless required by applicable law or agreed to in writing, software
---   distributed under the License is distributed on an "AS IS" BASIS,
---   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
---   See the License for the specific language governing permissions and
---   limitations under the License.
---
+-- This plugin is generated from KAM.cf (Apache-2.0) and is a derivative work
+-- of it. The full KAM.cf credits and Apache-2.0 notice travel WITH the rules,
+-- in the kam_rules.map header (`_kam_credits` / `_kam_license` keys).
+-- KAM.cf home: https://mcgrail.com/template/projects#KAM1
 -- The converter itself (rspamd-kam-rules) is MIT-licensed.
 -- ---------------------------------------------------------------------------"""
 # Rule/symbol names are interpolated into the generated Lua as table keys, so
@@ -194,21 +220,32 @@ def extract_regex(value: str) -> str | None:
     value = value.strip()
     if not value:
         return None
+    # Perl regex delimiters: /re/ or m<delim>re<delim>. Paired brackets
+    # ({}, (), [], <>) open/close with different chars and may nest (e.g.
+    # m{a{2}b}), so track depth for those; same-char delimiters do not nest.
+    paired = {"{": "}", "(": ")", "[": "]", "<": ">"}
     if value.startswith("/"):
-        delimiter, start = "/", 1
+        opener, start = "/", 1
     elif value.startswith("m") and len(value) > 2 and not value[1].isalnum():
-        delimiter, start = value[1], 2
+        opener, start = value[1], 2
     else:
         return None
+    closer = paired.get(opener, opener)
 
     escaped = False
+    depth = 0
     for index in range(start, len(value)):
         char = value[index]
         if escaped:
             escaped = False
         elif char == "\\":
             escaped = True
-        elif char == delimiter:
+        elif closer != opener and char == opener:
+            depth += 1
+        elif char == closer:
+            if depth > 0:
+                depth -= 1
+                continue
             end = index + 1
             while end < len(value) and value[end] in "imsx":
                 end += 1
@@ -304,6 +341,9 @@ def parse_rules(
             if not expression:
                 omit(number, f"unsupported_{directive}", line)
                 continue
+            # SA's `$?` (optional end-of-line) is not valid PCRE/rspamd syntax;
+            # escape it to a literal `\$?` so the regex compiles. Flags suffix
+            # (only imsx) never contains `$?`, so escaping the whole string is safe.
             expression = re.sub(r"(?<!\\)\$\?", r"\\$?", expression)
             rules[name] = Rule(
                 name=name,
@@ -328,6 +368,10 @@ def parse_rules(
         rule.tflags = tflags.get(name, set())
         rule.maxhits = maxhits.get(name)
 
+    # Iteratively expand <tag> references. Bounded by tag count + 1 so a cyclic
+    # definition (<A>-><B>-><A>) terminates with the unresolved <tag> left as a
+    # literal — that produces an invalid regex, caught at rspamd_regexp.create
+    # (returns nil -> rule disabled), so a malformed cycle degrades safe.
     resolved_tags = dict(replace_tags)
     for _ in range(len(resolved_tags) + 1):
         changed = False
@@ -393,48 +437,162 @@ def lua_string(value: str) -> str:
     return f"[{level}[{value}]{level}]"
 
 
-LUA_RUNTIME = """local expressions = {}
+LUA_RUNTIME = """local rules = {}
+local replacements = {}
+local external_dependencies = {}
+local expressions = {}
 local rule_count = 0
 local disabled_rule_count = 0
 
+-- Symbol names are interpolated nowhere as code — they are only ever table keys
+-- and insert_result() arguments — but the map is read from disk and could be
+-- tampered with, so re-validate every name against the SA symbol charset (same
+-- gate the Python emitter applies) before trusting a map entry.
+local valid_name = rspamd_regexp.create('/^[A-Za-z0-9_]+$/')
+
+-- Atom extractor for meta expressions; defined before compile_rule because
+-- rspamd_expression.create captures it as the parse callback.
 local function parse_atom(str)
   return str:match('^([^, %s%(%)><+!|&]+)') or ''
 end
 
-local function match_data(rule, data, raw, max_matches)
-  if not data or not rule.re or rule.disabled then return 0 end
-  if rule.multiple then return rule.re:matchn(data, max_matches or -1, raw) end
-  return rule.re:match(data, raw) and 1 or 0
+-- KAM rule.kind -> rspamd re-cache scan type passed to task:process_regexp.
+-- These are the categories rspamd compiles into ONE combined Hyperscan DB and
+-- scans in a single pass per category — the whole point of the native path.
+--   body    -> sabody    (normalised, de-HTMLised text parts; SA `body` semantics)
+--   rawbody -> sarawbody  (raw decoded text parts)
+--   full    -> rawmime    (entire raw message)
+--   uri     -> url
+--   header  -> header / rawheader (+ header-name + strong/case flags)
+--   mimeheader -> mimeheader
+-- header rules with an addr/name transform, or the ALL pseudo-header, cannot go
+-- through the combined DB (they need per-address Lua post-processing or the
+-- allheader blob), so they keep an individually-compiled re + Lua scan path.
+local SCAN_TYPE = {
+  body = 'sabody', rawbody = 'sarawbody', full = 'rawmime', uri = 'url',
+}
+
+-- A header rule is "native" (combined-DB) only when it is a single concrete
+-- header with no addr/name transform. ALL / ToCc / MESSAGEID multi-header and
+-- addr/name modes drop to the slow per-value Lua path.
+local function header_is_native(rule)
+  if rule.header_mode == 'addr' or rule.header_mode == 'name' then return false end
+  if rule.header == 'ALL' or rule.header == 'ToCc' or rule.header == 'MESSAGEID' then return false end
+  return true
 end
 
-local function add_matches(rule, total, data, raw)
-  if rule.maxhits and total >= rule.maxhits then return rule.maxhits, true end
-  local remaining = rule.maxhits and (rule.maxhits - total) or -1
-  total = total + match_data(rule, data, raw, remaining)
-  if rule.maxhits and total >= rule.maxhits then return rule.maxhits, true end
-  return total, total > 0 and not rule.multiple
+-- Compile one parsed rule entry: build its regexp (and register it in the
+-- combined re-cache for the native fast path) or its meta expression, flagging
+-- it disabled on failure so a broken rule is never scored.
+local function compile_rule(name, rule)
+  if rule.kind == 'meta' then
+    local expr = rspamd_expression.create(rule.expression, parse_atom, rspamd_config:get_mempool())
+    if expr then
+      expressions[name] = expr
+      rule.disabled = nil
+    else
+      rule.disabled = true
+      disabled_rule_count = disabled_rule_count + 1
+      rspamd_logger.errx(rspamd_config, 'cannot compile KAM meta %s: %s', name, rule.expression)
+    end
+    return
+  end
+
+  local re = rspamd_regexp.create(rule.expression)
+  if not re then
+    rule.disabled = true
+    disabled_rule_count = disabled_rule_count + 1
+    rspamd_logger.errx(rspamd_config, 'cannot compile KAM regexp %s: %s', name, rule.expression)
+    return
+  end
+  -- maxhits caps a `multiple` rule; a non-multiple rule stops at the first hit.
+  re:set_max_hits(rule.multiple and (rule.maxhits or 0) or 1)
+  rule.re = re
+  rule.disabled = nil
+
+  -- Decide the scan type and register the regexp with the re-cache so it joins
+  -- the combined Hyperscan DB. body/rawbody/full/uri map straight through;
+  -- header/mimeheader register against their concrete header (+ raw flag).
+  local scan_type = SCAN_TYPE[rule.kind]
+  if scan_type then
+    rule.scan_type = scan_type
+    rspamd_config:register_regexp({ re = re, type = scan_type })
+  elseif rule.kind == 'mimeheader' and header_is_native(rule) then
+    rule.scan_type = 'mimeheader'
+    rspamd_config:register_regexp({ re = re, type = 'mimeheader', header = rule.header })
+  elseif rule.kind == 'header' and header_is_native(rule) then
+    rule.scan_type = rule.header_mode == 'raw' and 'rawheader' or 'header'
+    rspamd_config:register_regexp({ re = re, type = rule.scan_type, header = rule.header })
+  else
+    -- Slow path (addr/name transform, ALL/ToCc/MESSAGEID): scanned in Lua.
+    rule.scan_type = nil
+  end
 end
 
-local function match_header(task, rule)
+-- Parse the jsonl map body into (rules, replacements, external_dependencies).
+-- Line 1 is the header object ({_kam, replacements, external_dependencies});
+-- every later non-blank line is one rule object keyed by its `name`. Malformed
+-- lines and entries with an invalid name are skipped, not fatal — a single bad
+-- line never takes the whole ruleset down.
+local function parse_map(data)
+  local ucl = require 'ucl'
+  local parsed_rules, repl, deps = {}, {}, {}
+  local header_seen = false
+  for line in data:gmatch('[^\\r\\n]+') do
+    if line:match('%S') then
+      local parser = ucl.parser()
+      local ok, err = parser:parse_string(line)
+      if not ok then
+        rspamd_logger.errx(rspamd_config, 'KAM map: bad json line: %s', err)
+      else
+        local obj = parser:get_object()
+        if not header_seen then
+          header_seen = true
+          repl = obj.replacements or {}
+          deps = obj.external_dependencies or {}
+        elseif type(obj.name) == 'string' and valid_name:match(obj.name) then
+          local name = obj.name
+          obj.name = nil
+          parsed_rules[name] = obj
+        end
+      end
+    end
+  end
+  return parsed_rules, repl, deps
+end
+
+-- SLOW PATH ONLY: header rules with an addr/name transform, or ALL/ToCc/
+-- MESSAGEID multi-header. These cannot ride the combined Hyperscan DB, so they
+-- scan their individually-compiled rule.re value-by-value in Lua.
+local function match_header_slow(task, rule)
+  if rule.header == 'ALL' then
+    local data = task:get_raw_headers()
+    local hits = 0
+    if data then
+      if rule.multiple then
+        -- matchn returns the hit count (capped by maxhits, 0 = uncapped).
+        hits = rule.re:matchn(data, rule.maxhits or 0, true) or 0
+      elseif rule.re:match(data, true) then
+        hits = 1
+      end
+    end
+    if rule.negate then
+      return hits > 0 and 0 or 1
+    end
+    return rule.multiple and hits or (hits > 0 and 1 or 0)
+  end
+
   local header_names = { rule.header }
   if rule.header == 'ToCc' then header_names = { 'To', 'Cc', 'Bcc' } end
   if rule.header == 'MESSAGEID' then header_names = { 'Message-ID', 'X-Message-ID', 'Resent-Message-ID' } end
-  if rule.header == 'ALL' then
-    local result = add_matches(rule, 0, task:get_raw_headers(), true)
-    if rule.negate then return result > 0 and 0 or 1 end
-    return result
-  end
-  local matched = false
+
   local hits = 0
-  local done = false
   for _, header_name in ipairs(header_names) do
     local values = {}
     if rule.kind == 'mimeheader' then
       for _, part in ipairs(task:get_parts() or {}) do
-        -- get_header_full may be absent on older rspamd mime-part bindings;
-        -- guard so a missing method degrades to no match instead of erroring.
         if part.get_header_full then
-          for _, hdr in ipairs(part:get_header_full(header_name, false) or {}) do table.insert(values, hdr) end
+          for _, hdr in ipairs(part:get_header_full(header_name, rule.header_mode == 'case') or {}) do table.insert(values, hdr) end
         end
       end
     else
@@ -442,28 +600,37 @@ local function match_header(task, rule)
     end
     for _, hdr in ipairs(values) do
       local value = rule.header_mode == 'raw' and hdr.value or (hdr.decoded or hdr.value)
-      if rule.header_mode == 'addr' then
-        local addresses = rspamd_util.parse_mail_address(value or '') or {}
-        for _, address in ipairs(addresses) do
-          if address.addr then hits, done = add_matches(rule, hits, address.addr, false) end
-          if done then break end
-        end
-      elseif rule.header_mode == 'name' then
-        local addresses = rspamd_util.parse_mail_address(value or '') or {}
-        for _, address in ipairs(addresses) do
-          if address.name then hits, done = add_matches(rule, hits, address.name, false) end
-          if done then break end
+      local candidates = {}
+      if rule.header_mode == 'addr' or rule.header_mode == 'name' then
+        for _, address in ipairs(rspamd_util.parse_mail_address(value or '') or {}) do
+          local field = rule.header_mode == 'addr' and address.addr or address.name
+          if field then table.insert(candidates, field) end
         end
       elseif value then
-        hits, done = add_matches(rule, hits, value, rule.header_mode == 'raw')
+        table.insert(candidates, value)
       end
-      if done then break end
+      for _, cand in ipairs(candidates) do
+        if rule.re:match(cand, rule.header_mode == 'raw') then
+          hits = hits + 1
+          if not rule.multiple then break end
+          if rule.maxhits and hits >= rule.maxhits then break end
+        end
+      end
+      if not rule.multiple and hits > 0 then break end
+      if rule.maxhits and hits >= rule.maxhits then break end
     end
-    if done then break end
+    if not rule.multiple and hits > 0 then break end
+    if rule.maxhits and hits >= rule.maxhits then break end
   end
-  matched = hits > 0
-  if rule.negate then matched = not matched end
-  return matched and (rule.multiple and hits or 1) or 0
+
+  -- negate handled with an early return (mirrors the ALL branch above): a
+  -- negated rule fires once when the pattern is ABSENT, weight 1, never a count.
+  -- Folding negate into the multiple/hits ternary breaks on hits==0 because 0
+  -- is truthy in Lua (`(multiple and 0 or 1)` returns 0, not 1).
+  if rule.negate then
+    return hits > 0 and 0 or 1
+  end
+  return rule.multiple and hits or (hits > 0 and 1 or 0)
 end
 
 local function eval_atom(name, task)
@@ -482,51 +649,106 @@ local function eval_atom(name, task)
     if expression then
       result = expression:process(function(atom) return eval_atom(atom, task) end)
     end
+  elseif rule.scan_type then
+    -- NATIVE FAST PATH: single combined-Hyperscan-DB lookup. process_regexp
+    -- returns the hit count (0 when no match); the DB was already scanned once
+    -- for the whole ruleset, so this is just a result fetch.
+    if rule.kind == 'header' or rule.kind == 'mimeheader' then
+      result = task:process_regexp(rule.re, rule.scan_type, rule.header, rule.header_mode == 'case')
+    else
+      result = task:process_regexp(rule.re, rule.scan_type)
+    end
+    result = result or 0
+    if rule.negate then result = result > 0 and 0 or 1 end
+    if not rule.multiple and result > 1 then result = 1 end
   elseif rule.kind == 'header' or rule.kind == 'mimeheader' then
-    result = match_header(task, rule)
-  elseif rule.kind == 'body' then
-    local done = false
-    if not rule.nosubject then
-      result, done = add_matches(rule, result, task:get_subject(), false)
-    end
-    for _, part in ipairs(task:get_text_parts() or {}) do
-      if done then break end
-      result, done = add_matches(rule, result, part:get_content(), false)
-    end
-  elseif rule.kind == 'rawbody' then
-    result = add_matches(rule, 0, task:get_rawbody(), true)
-  elseif rule.kind == 'full' then
-    result = add_matches(rule, 0, task:get_content(), true)
-  elseif rule.kind == 'uri' then
-    local done = false
-    for _, url in ipairs(task:get_urls() or {}) do
-      result, done = add_matches(rule, result, url:get_text(), false)
-      if done then break end
-    end
+    result = match_header_slow(task, rule)
   end
   cache[name] = result or 0
   return cache[name]
 end
 
+-- Init load (synchronous): read the bundled map beside the plugin so symbols
+-- and regexps can be registered at config-load time — registration (and the
+-- combined-DB compile) only happens at config load. `replacements`/
+-- `external_dependencies` come from the same header (dependency wiring +
+-- has_symbol fallback for external atoms).
+local function read_file(path)
+  local handle = io.open(path, 'r')
+  if not handle then return nil end
+  local data = handle:read('*a')
+  handle:close()
+  return data
+end
+
+do
+  -- Prefer the self-updated cache copy (/var/lib/rspamd, written by the poll
+  -- below); fall back to the shipped seed (/etc/rspamd) on first boot or if the
+  -- cache is absent. Both feed the same parse_map → native register at load.
+  local init_data = read_file(kam_cache_path)
+  local source = kam_cache_path
+  if not init_data then
+    init_data = read_file(kam_map_path)
+    source = kam_map_path
+  end
+  if not init_data then
+    rspamd_logger.errx(rspamd_config,
+      'KAM: cannot read map (tried %s then %s); no rules loaded',
+      kam_cache_path, kam_map_path)
+    init_data = ''
+  else
+    rspamd_logger.infox(rspamd_config, 'KAM: loaded rule map from %s', source)
+  end
+  rules, replacements, external_dependencies = parse_map(init_data)
+end
+
+-- Self-update poll (C1): rspamd fetches kam_map_url on map_watch_interval and
+-- hands the full new content to this callback. It does NOT (cannot) register
+-- rules here — native register_regexp only runs at config load. It only writes
+-- the bytes to the rspamd-writable cache path (atomic tmp+rename, lock-guarded
+-- so concurrent workers can't tear the file); a 'systemctl reload rspamd' timer
+-- then re-reads the cache and re-registers. Set map_url = "" to disable.
+if kam_map_url and kam_map_url ~= '' then
+  rspamd_config:add_map({
+    type = 'callback',
+    url = kam_map_url,
+    description = 'KAM rule map self-update (downloads to cache; reload applies)',
+    callback = function(content)
+      if not content or #content == 0 then return end
+      -- Skip the write if the cache already holds these exact bytes — avoids
+      -- needless churn and log noise when the poll returns an unchanged map.
+      local current = read_file(kam_cache_path)
+      if current == content then return end
+      local tmp = kam_cache_path .. '.tmp'
+      local lock = rspamd_util.lock_file(kam_cache_path .. '.lock')
+      local fh = io.open(tmp, 'w')
+      if not fh then
+        if lock then rspamd_util.unlock_file(lock) end
+        rspamd_logger.errx(rspamd_config,
+          'KAM: cannot write map cache %s (check perms; rspamd user owns /var/lib/rspamd)',
+          tmp)
+        return
+      end
+      fh:write(content)
+      fh:close()
+      local ok = os.rename(tmp, kam_cache_path)
+      if lock then rspamd_util.unlock_file(lock) end
+      if ok then
+        rspamd_logger.infox(rspamd_config,
+          'KAM: downloaded updated rule map to %s (%s bytes); '
+          .. 'reload rspamd to apply', kam_cache_path, tostring(#content))
+      else
+        os.remove(tmp)
+        rspamd_logger.errx(rspamd_config, 'KAM: failed to rename %s -> %s',
+          tmp, kam_cache_path)
+      end
+    end,
+  })
+end
+
 for name, rule in pairs(rules) do
   rule_count = rule_count + 1
-  if rule.kind == 'meta' then
-    expressions[name] = rspamd_expression.create(rule.expression, parse_atom, rspamd_config:get_mempool())
-    if not expressions[name] then
-      rule.disabled = true
-      disabled_rule_count = disabled_rule_count + 1
-      rspamd_logger.errx(rspamd_config, 'cannot compile KAM meta %s: %s', name, rule.expression)
-    end
-  else
-    rule.re = rspamd_regexp.create(rule.expression)
-    if rule.re then
-      rule.re:set_max_hits(rule.multiple and (rule.maxhits or -1) or 1)
-    else
-      rule.disabled = true
-      disabled_rule_count = disabled_rule_count + 1
-      rspamd_logger.errx(rspamd_config, 'cannot compile KAM regexp %s: %s', name, rule.expression)
-    end
-  end
+  compile_rule(name, rule)
 end
 
 local function kam_callback(task)
@@ -570,67 +792,131 @@ rspamd_logger.infox(
 """
 
 
-def generate_lua(
+# Default map location. The bundled file is read synchronously at config load so
+# rules register and compile into the combined Hyperscan DB at init. Overridable
+# via the `kam {}` config block (`map_path`). There is no live HTTP watch:
+# rspamd registers native regexps only at config load, so an updated map is
+# applied by `systemctl reload rspamd` (full reconfigure), not a map poll.
+#
+# Self-update (C1): rspamd itself polls DEFAULT_MAP_URL on `map_watch_interval`
+# and atomically writes a fresh copy to DEFAULT_CACHE_PATH — under /var/lib/rspamd
+# (DBDIR), the only map dir the dropped-priv rspamd user can write (/etc/rspamd is
+# root-owned → EACCES). At config load the runtime PREFERS the cache copy and
+# falls back to the shipped seed at DEFAULT_MAP_PATH. The poll only downloads; a
+# separate `systemctl reload rspamd` (timer) re-registers the native regexps,
+# which rspamd can only do at config load.
+DEFAULT_MAP_PATH = "/etc/rspamd/kam_rules.map"
+DEFAULT_CACHE_PATH = "/var/lib/rspamd/kam_rules.map"
+DEFAULT_MAP_URL = (
+    "https://raw.githubusercontent.com/eilandert/rspamd-kam-rules/main/dist/kam_rules.map"
+)
+
+
+def _map_rule_object(name: str, rule: Rule) -> dict[str, object]:
+    """One rule as a plain dict for the jsonl map. Mirrors the Lua-table fields
+    the runtime reads; omitted keys default to nil/false in Lua."""
+    obj: dict[str, object] = {
+        "name": name,
+        "kind": rule.kind,
+        "expression": rule.expression,
+        "score": rule.score,
+    }
+    if rule.description:
+        obj["description"] = rule.description
+    if rule.header:
+        obj["header"] = rule.header
+    if rule.header_mode:
+        obj["header_mode"] = rule.header_mode
+    if rule.negate:
+        obj["negate"] = True
+    if "multiple" in rule.tflags:
+        obj["multiple"] = True
+    # NOTE: SA `nosubject` (exclude Subject from body scan) is a no-op under
+    # rspamd — its `sabody` re-cache type already scans body parts only and never
+    # prepends the Subject (unlike SA's `body`). So we intentionally do NOT emit
+    # it; the runtime would have nothing to do with it.
+    if rule.maxhits is not None:
+        obj["maxhits"] = rule.maxhits
+    return obj
+
+
+def generate_map(
     rules: dict[str, Rule],
-    source_url: str,
-    source_sha256: str,
     external_dependencies: set[str],
+    source_url: str = DEFAULT_URL,
+    source_sha256: str = "",
     generated_date: str | None = None,
 ) -> bytes:
-    # Generation date (UTC). The publishing workflow is SHA-256-gated, so this
-    # is only re-stamped when KAM.cf actually changes — it dates the ruleset
-    # version, not every CI run.
+    """The data half: jsonl. Line 1 is the header (metadata + replacements +
+    external_dependencies); each later line is one rule object. Names are
+    pre-validated by VALID_NAME at parse time, and the Lua loader re-validates
+    them, so a tampered map can introduce no symbol outside the SA charset.
+    The loader reads only `replacements`/`external_dependencies` from the header
+    and ignores every `_`-prefixed metadata key, so they're safe to carry."""
     if generated_date is None:
         generated_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    header = {
+        "_kam": 1,
+        "_project": PROJECT_NAME,
+        "_copyright": PROJECT_COPYRIGHT,
+        "_license": PROJECT_LICENSE,
+        "_homepage": PROJECT_HOMEPAGE,
+        "_overview": PROJECT_OVERVIEW,
+        "_howto": PROJECT_HOWTO,
+        "_source_url": source_url,
+        "_source_sha256": source_sha256,
+        "_generated": generated_date,
+        "_kam_credits": KAM_CREDITS,
+        "_kam_license": KAM_LICENSE,
+        "replacements": dict(sorted(SYMBOL_REPLACEMENTS.items())),
+        "external_dependencies": sorted(external_dependencies),
+    }
+    out = [json.dumps(header, sort_keys=True, ensure_ascii=False)]
+    for name in sorted(rules):
+        out.append(
+            json.dumps(_map_rule_object(name, rules[name]), sort_keys=True, ensure_ascii=False)
+        )
+    return ("\n".join(out) + "\n").encode()
+
+
+def generate_lua(
+    source_url: str,
+    source_sha256: str,
+    map_path: str = DEFAULT_MAP_PATH,
+) -> bytes:
+    # The lua runtime is static and version-less by design — the ruleset version
+    # (date + source SHA) lives in the map header, not here — so this emits no
+    # generation date.
+    howto = "\n".join(f"-- {line}".rstrip() for line in PROJECT_HOWTO)
     lines = [
-        "-- Generated by rspamd-kam-rules. Do not edit.",
-        f"-- Source: {source_url}",
-        f"-- Source-SHA256: {source_sha256}",
-        f"-- Generated: {generated_date} (UTC)",
+        "-- ===========================================================================",
+        f"-- {PROJECT_NAME} — KAM.cf compiled to a native Rspamd Lua plugin.",
+        f"-- {PROJECT_COPYRIGHT}",
+        f"-- License: {PROJECT_LICENSE}",
+        f"-- Home:    {PROJECT_HOMEPAGE}",
+        f"-- More Rspamd modules (olefy, yarad, gyzor, mailstrix, …): {PROJECT_OVERVIEW}",
+        "--",
+        howto,
+        "-- ===========================================================================",
         "",
-        KAM_LICENSE_HEADER,
+        KAM_LICENSE_POINTER,
         "",
         'local rspamd_expression = require "rspamd_expression"',
         'local rspamd_logger = require "rspamd_logger"',
         'local rspamd_regexp = require "rspamd_regexp"',
         'local rspamd_util = require "rspamd_util"',
         "",
-        "local rules = {",
+        "-- Map locations + self-update URL, overridable via the kam {} config block.",
+        "--   map_path   = shipped seed (read-only /etc/rspamd) — fallback only.",
+        "--   cache_path = rspamd-writable copy (/var/lib/rspamd) the poll writes",
+        "--                and the runtime PREFERS at load.",
+        "--   map_url    = remote map polled on map_watch_interval; \"\" disables.",
+        "local opts = rspamd_config:get_all_opt('kam') or {}",
+        f"local kam_map_path = opts.map_path or {lua_string(map_path)}",
+        f"local kam_cache_path = opts.cache_path or {lua_string(DEFAULT_CACHE_PATH)}",
+        f"local kam_map_url = opts.map_url or {lua_string(DEFAULT_MAP_URL)}",
+        "",
     ]
-    for name in sorted(rules):
-        rule = rules[name]
-        fields = [
-            f"kind = {lua_string(rule.kind)}",
-            f"expression = {lua_string(rule.expression)}",
-            f"score = {rule.score:.12g}",
-        ]
-        if rule.description:
-            fields.append(f"description = {lua_string(rule.description)}")
-        if rule.header:
-            fields.append(f"header = {lua_string(rule.header)}")
-        if rule.header_mode:
-            fields.append(f"header_mode = {lua_string(rule.header_mode)}")
-        if rule.negate:
-            fields.append("negate = true")
-        if "multiple" in rule.tflags:
-            fields.append("multiple = true")
-        if "nosubject" in rule.tflags:
-            fields.append("nosubject = true")
-        if rule.maxhits is not None:
-            fields.append(f"maxhits = {rule.maxhits}")
-        lines.append(f'  ["{name}"] = {{ {", ".join(fields)} }},')
-    lines.append("}")
-    lines.append("")
-    lines.append("local replacements = {")
-    for source, target in sorted(SYMBOL_REPLACEMENTS.items()):
-        lines.append(f'  ["{source}"] = {lua_string(target)},')
-    lines.append("}")
-    lines.append("")
-    lines.append("local external_dependencies = {")
-    for dependency in sorted(external_dependencies):
-        lines.append(f"  {lua_string(dependency)},")
-    lines.append("}")
-    lines.append("")
     return ("\n".join(lines) + "\n" + LUA_RUNTIME).encode()
 
 
@@ -643,7 +929,7 @@ def convert(
     unavailable_symbols: set[str] | None = None,
     expected_sha256: str | None = None,
     local_rules: bytes | None = None,
-) -> tuple[bytes, dict]:
+) -> tuple[bytes, bytes, dict]:
     if len(source) < min_bytes:
         raise ConversionError(f"source is unexpectedly small: {len(source)} bytes < {min_bytes}")
     # SHA gate runs on the pristine upstream source only, so update-if-changed.sh
@@ -667,7 +953,23 @@ def convert(
     if len(rules) < min_rules:
         raise ConversionError(f"too few converted rules: {len(rules)} < {min_rules}")
     dependencies = external_meta_dependencies(rules, external)
-    lua = generate_lua(rules, source_url, source_sha256, dependencies)
+    # Stamp map + lua with ONE shared date so the two artifacts never disagree and
+    # a single regen is internally consistent. (CI is SHA-gated and only regens
+    # when KAM.cf actually changes, so this dates the ruleset version.)
+    generated_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lua = generate_lua(source_url, source_sha256)
+    mapdata = generate_map(rules, dependencies, source_url, source_sha256, generated_date)
+    # F5 canary: a regex rule still carrying a `<tag>` token. Most are dead — an
+    # unexpanded replace_tag (e.g. <S>, <NUM1>) compiles fine but matches the
+    # literal string `<S>`, which never appears, so the rule silently never fires;
+    # a parsing/replace_rules regression shows up here in CI, not only at runtime.
+    # NOTE: this also catches rules whose regex *legitimately* contains literal
+    # HTML tags (<small>, <tr>, <title>) — those compile AND fire correctly, so a
+    # nonzero count is expected and not by itself a failure; inspect the names.
+    unexpanded_tag_rules = sorted(
+        name for name, rule in rules.items()
+        if rule.kind != "meta" and re.search(r"<[A-Za-z0-9_]+>", rule.expression)
+    )
     report = {
         "source_url": source_url,
         "source_bytes": len(source),
@@ -675,6 +977,8 @@ def convert(
         "local_rules_sha256": hashlib.sha256(local_rules).hexdigest() if local_rules else None,
         "output_bytes": len(lua),
         "output_sha256": hashlib.sha256(lua).hexdigest(),
+        "map_bytes": len(mapdata),
+        "map_sha256": hashlib.sha256(mapdata).hexdigest(),
         "converted_rule_count": len(rules),
         "converted_rule_types": dict(sorted(Counter(rule.kind for rule in rules.values()).items())),
         "omitted_directives": dict(sorted(omitted.items())),
@@ -683,8 +987,11 @@ def convert(
         "dropped_meta_count": len(dropped),
         "external_dependencies": sorted(dependencies),
         "external_dependency_count": len(dependencies),
+        "unexpanded_tag_rules": unexpanded_tag_rules,
+        "unexpanded_tag_rule_count": len(unexpanded_tag_rules),
+        "generated_date": generated_date,
     }
-    return lua, report
+    return lua, mapdata, report
 
 
 def atomic_write(path: Path, content: bytes, mode: int = 0o644) -> None:
@@ -710,7 +1017,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path)
     parser.add_argument("--url", default=DEFAULT_URL)
-    parser.add_argument("--output", type=Path, default=root / "dist" / "kam.lua")
+    # kam.lua is a static thin runtime: its rule data lives in the map, so it
+    # only changes when the runtime *code* changes, not when KAM.cf does. Daily
+    # CI therefore regenerates the map + report only; pass --output (or
+    # --emit-lua) to also re-emit the committed dist/kam.lua after a code change.
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--emit-lua",
+        action="store_true",
+        help="also write dist/kam.lua (default: map + report only)",
+    )
+    parser.add_argument("--map", type=Path, default=root / "dist" / "kam_rules.map")
     parser.add_argument("--report", type=Path, default=root / "dist" / "report.json")
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--min-bytes", type=int, default=100_000)
@@ -723,7 +1040,7 @@ def main() -> int:
 
     source = args.input.read_bytes() if args.input else download(args.url, args.timeout)
     local_rules = args.local_rules.read_bytes() if args.local_rules and args.local_rules.exists() else None
-    lua, report = convert(
+    lua, mapdata, report = convert(
         source,
         args.url,
         args.min_bytes,
@@ -733,11 +1050,15 @@ def main() -> int:
         args.expected_sha256,
         local_rules,
     )
-    atomic_write(args.output, lua)
+    lua_out = args.output or (root / "dist" / "kam.lua" if args.emit_lua else None)
+    if lua_out is not None:
+        atomic_write(lua_out, lua)
+    atomic_write(args.map, mapdata)
     atomic_write(args.report, (json.dumps(report, indent=2, sort_keys=True) + "\n").encode())
+    wrote = f"{lua_out} + " if lua_out is not None else ""
     print(
-        f"wrote {args.output} ({report['converted_rule_count']} rules, "
-        f"sha256 {report['output_sha256']})"
+        f"wrote {wrote}{args.map} ({report['converted_rule_count']} rules, "
+        f"lua sha256 {report['output_sha256']}, map sha256 {report['map_sha256']})"
     )
     return 0
 

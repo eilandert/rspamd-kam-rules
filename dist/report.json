@@ -633,7 +633,10 @@
     "R_SPF_SOFTFAIL"
   ],
   "external_dependency_count": 11,
+  "generated_date": "2026-06-30",
   "local_rules_sha256": "29bb9b69759ee5249798315980561d6969af249fe5de7afd6736c802c971aa1f",
+  "map_bytes": 614510,
+  "map_sha256": "c5988e11fc8ed9c6fc79cb2b5e6d4a3e1a88a1ca0cdafa1b0e3b5135fa28f7a2",
   "omitted_directives": {
     "enlist_addrlist": 1,
     "unsupported_header": 5
@@ -670,9 +673,26 @@
       "text": "header          __WLHTMLATTACH          eval:check_from_in_list('WLHTMLATTACH')"
     }
   ],
-  "output_bytes": 631903,
-  "output_sha256": "0b46ee110e03275fb050c7bba4498ef0e9e4138669191f7c305ccccda345ae6a",
-  "source_bytes": 618869,
-  "source_sha256": "5e76d925d8affe238b7bc9e51f49b0626ca1880237841106301b90fe91fc7713",
-  "source_url": "https://mcgrail.com/downloads/KAM.cf"
+  "output_bytes": 16674,
+  "output_sha256": "b2c58f0d46f96fb68747bbee4126bff50a1658f0d8f2804f164c690e4aa07561",
+  "source_bytes": 618910,
+  "source_sha256": "ec2e15c10e53acc9d905834760998fdecae3772f2e50ea64571ac5622efe5d4c",
+  "source_url": "https://mcgrail.com/downloads/KAM.cf",
+  "unexpanded_tag_rule_count": 14,
+  "unexpanded_tag_rules": [
+    "FUZZY_SECURITY",
+    "FUZZY_WALLET",
+    "__CBJ_GiveMeABreak3",
+    "__GB_FAKE_HOTEL",
+    "__GB_OBFU_BANK",
+    "__GB_PAYPAL_PHONE",
+    "__KAM_BIGSMALL",
+    "__KAM_CRIM5",
+    "__KAM_CRIM6",
+    "__KAM_FAKE_GOOGLEGROUP2",
+    "__KAM_H1QNUM1",
+    "__KAM_HTMLNOISE1",
+    "__KAM_KN_3",
+    "__KAM_NEWSLETTER"
+  ]
 }
